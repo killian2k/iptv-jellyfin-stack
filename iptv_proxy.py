@@ -46,6 +46,7 @@ def clean_name(name):
     clean = re.sub(r'\|[^\|]+\|', '', name)
     clean = re.sub(r'USA:', '', clean)
     clean = re.sub(r'[▼●★■□▲▶▷\-\s]+', ' ', clean).strip()
+    clean = clean.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&apos;')
     return clean
 
 def get_category_info(name):
