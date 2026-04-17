@@ -51,21 +51,38 @@ def clean_name(name):
 def get_category_info(name):
     name_upper = name.upper()
     if any(x in name_upper for x in ["---", "▼", "▲", "●", "★"]): return None, None
-    country = "Other"
+    
+    country = "Global"
     if "|FR|" in name_upper: country = "FR"
     elif "|US|" in name_upper or "USA:" in name_upper: country = "US"
     elif "|UK|" in name_upper: country = "UK"
-    elif "|CA|" in name_upper: country = "CA"
+    elif "|CA|" in name_upper or "|QC|" in name_upper: country = "CA"
+    
     is_sport = any(x in name_upper for x in ["SPORT", "BEIN", "RMC", "EUROSPORT", "DAZN", "EQUIPE", "GOLF", "FOOT", "ELEVEN", "NBA", "ESPN", "TNT US", "FS1", "FS2", "NBCS", "GOLTV"])
-    if country == "FR":
-        if is_sport: return "FR - Sports", "Sports"
-        if any(x in name_upper for x in ["CANAL+", "CINE+", "OCS"]): return "FR - Cinema", "Movies"
-        return "FR - Entertainment", "Entertainment"
-    if country == "US":
-        if is_sport: return "US - Sports", "Sports"
-        return "US - Entertainment", "Entertainment"
-    if is_sport: return f"{country} - Sports", "Sports"
-    return f"{country} - General", "Entertainment"
+    is_cinema = any(x in name_upper for x in ["CANAL+", "CINE+", "OCS", "MOVIE", "FILM", "CINEMA"])
+    is_news = any(x in name_upper for x in ["NEWS", "INFO", "BFM", "CNEWS", "LCI", "CNN", "BBC", "FOX NEWS", "MSNBC"])
+    is_kids = any(x in name_upper for x in ["KIDS", "DISNEY", "NICKELODEON", "CARTOON", "GULLI", "PIWI", "BOOMERANG"])
+    
+    tags = [country]
+    xml_cat = "Entertainment"
+    
+    if is_sport: 
+        tags.append("Sports")
+        xml_cat = "Sports"
+    elif is_cinema: 
+        tags.append("Movies")
+        xml_cat = "Movies"
+    elif is_news:
+        tags.append("News")
+        xml_cat = "News"
+    elif is_kids:
+        tags.append("Kids")
+        xml_cat = "Kids"
+    else:
+        tags.append("Entertainment")
+        
+    # Jellyfin uses ';' to split multiple categories in group-title
+    return ";".join(tags), xml_cat
 
 def update_cache():
     token = handshake()
@@ -77,21 +94,23 @@ def update_cache():
         processed = []
         m3u = "#EXTM3U\n"
         xmltv = '<?xml version="1.0" encoding="UTF-8"?>\n<tv generator-info-name="IPTV Proxy">\n'
-        priority_list = ["US - Sports", "FR - Sports", "FR - Entertainment", "US - Entertainment"]
+        
         for ch in channels:
             group, xml_cat = get_category_info(ch.get('name', ''))
             if not group: continue
             ch_id = str(ch.get('id'))
             display_name = clean_name(ch.get('name', ''))
             processed.append({'id': ch_id, 'display_name': display_name, 'group': group, 'xml_cat': xml_cat, 'logo': ch.get('logo', ''), 'cmd': ch.get('cmd')})
-        processed.sort(key=lambda x: (priority_list.index(x['group']) if x['group'] in priority_list else 99, x['group'], x['display_name']))
+        
         for item in processed:
             m3u += f'#EXTINF:-1 tvg-id="{item["id"]}" tvg-name="{item["display_name"]}" tvg-logo="{item["logo"]}" group-title="{item["group"]}",{item["display_name"]}\n'
             m3u += f'{PROXY_BASE}/play/{item["id"]}.ts\n'
             xmltv += f'  <channel id="{item["id"]}"><display-name>{item["display_name"]}</display-name>'
             if item["logo"]: xmltv += f'<icon src="{item["logo"]}" />'
             xmltv += '</channel>\n'
-        now = datetime.now()
+            
+        # Use utcnow() instead of local now() to prevent Jellyfin from ignoring timezone offsets
+        now = datetime.utcnow()
         start = now.replace(minute=0, second=0, microsecond=0)
         for item in processed:
             for i in range(24):
@@ -99,9 +118,11 @@ def update_cache():
                 p_end = (start + timedelta(hours=i+1)).strftime("%Y%m%d%H%M%S +0000")
                 xmltv += f'  <programme start="{p_start}" stop="{p_end}" channel="{item["id"]}">\n'
                 xmltv += f'    <title lang="en">Live: {item["display_name"]}</title>\n'
+                xmltv += f'    <desc lang="en">Live stream for {item["display_name"]}.</desc>\n'
                 xmltv += f'    <category lang="en">{item["xml_cat"]}</category>\n'
                 xmltv += f'  </programme>\n'
         xmltv += '</tv>'
+        
         with cache_lock:
             cache["channels"] = channels
             cache["playlist"] = m3u
@@ -162,8 +183,6 @@ def play(ch_id):
                     if chunk: yield chunk
             except Exception as e: logging.error(f"Stream error: {e}")
         
-        # REMOVED Transfer-Encoding: chunked to prevent 502 Bad Gateway via Nginx
-        # Added direct_passthrough=True for optimal streaming
         return Response(stream_with_context(generate()), content_type='video/mp2t', headers={'Connection': 'keep-alive'}, direct_passthrough=True)
     except Exception as e:
         logging.error(f"Play error: {e}")
