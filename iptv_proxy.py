@@ -188,5 +188,40 @@ def play(ch_id):
         logging.error(f"Play error: {e}")
         return f"Error: {e}", 500
 
+@app.route('/vod/<vod_id>.<ext>', methods=['GET', 'HEAD', 'OPTIONS'])
+def play_vod(vod_id, ext):
+    if request.method == 'OPTIONS': return Response()
+    if request.method == 'HEAD': return Response(content_type=f'video/{ext}')
+    token = handshake()
+    if not token: return "Handshake failed", 500
+    
+    cmd_data = {"type": "movie", "stream_id": str(vod_id), "stream_source": None, "target_container": f'["{ext}"]'}
+    cmd_b64 = base64.b64encode(json.dumps(cmd_data).encode()).decode()
+    
+    headers = {"Cookie": f"mac={MAC}; stb_lang=en; timezone=Europe/Paris;", "User-Agent": UA, "Authorization": f"Bearer {token}", "X-User-Agent": "Model: MAG256; Link: WiFi"}
+    
+    try:
+        resp = requests.get(BASE_URL, params={"type": "vod", "action": "create_link", "cmd": cmd_b64}, headers=headers, timeout=25)
+        js = resp.json().get('js', {})
+        cmd_val = js.get('cmd', '')
+        if cmd_val.startswith('ffmpeg '): cmd_val = cmd_val[7:]
+        
+        # Clean the URL. Sometimes the provider sends [ext] which needs to be replaced.
+        url = cmd_val.replace(f"[{ext}]", ext)
+        
+        logging.info(f"Proxying VOD {vod_id} via {url}")
+        upstream = requests.get(url, headers=headers, stream=True, timeout=30)
+        
+        def generate():
+            try:
+                for chunk in upstream.iter_content(chunk_size=1024*1024):
+                    if chunk: yield chunk
+            except Exception as e: logging.error(f"VOD Stream error: {e}")
+        
+        return Response(stream_with_context(generate()), content_type=f'video/{ext}', headers={'Connection': 'keep-alive'}, direct_passthrough=True)
+    except Exception as e:
+        logging.error(f"VOD Play error: {e}")
+        return f"Error: {e}", 500
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8081, threaded=True)
