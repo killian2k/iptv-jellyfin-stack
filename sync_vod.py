@@ -137,22 +137,39 @@ def sync_vods():
         cat_dir = os.path.join(MOVIES_DIR, info['category'])
         os.makedirs(cat_dir, exist_ok=True)
         
-        filename = f"{sanitize_filename(base_name)} [{info['id']}].strm"
-        rel_path = os.path.join(info['category'], filename)
-        active_files.add(rel_path)
+        filename = f"{sanitize_filename(base_name)} [{info['id']}]"
+        strm_rel_path = os.path.join(info['category'], f"{filename}.strm")
+        nfo_rel_path = os.path.join(info['category'], f"{filename}.nfo")
         
-        filepath = os.path.join(MOVIES_DIR, rel_path)
-        if not os.path.exists(filepath):
+        active_files.add(strm_rel_path)
+        active_files.add(nfo_rel_path)
+        
+        strm_filepath = os.path.join(MOVIES_DIR, strm_rel_path)
+        if not os.path.exists(strm_filepath):
             try:
-                with open(filepath, 'w') as f:
+                with open(strm_filepath, 'w') as f:
                     f.write(f"{PROXY_BASE}/{info['id']}.mkv\n")
             except:
                 pass
+                
+        nfo_filepath = os.path.join(MOVIES_DIR, nfo_rel_path)
+        if not os.path.exists(nfo_filepath):
+            try:
+                with open(nfo_filepath, 'w', encoding='utf-8') as f:
+                    f.write(f'<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n')
+                    f.write(f'<movie>\n')
+                    f.write(f'  <title>{base_name}</title>\n')
+                    f.write(f'  <set>\n')
+                    f.write(f'    <name>IPTV {info["category"]}</name>\n')
+                    f.write(f'  </set>\n')
+                    f.write(f'</movie>\n')
+            except:
+                pass
 
-    # Cleanup old movies and empty folders
+    # Cleanup old movies, nfos, and empty folders
     for root, dirs, files in os.walk(MOVIES_DIR, topdown=False):
         for name in files:
-            if name.endswith(".strm"):
+            if name.endswith(".strm") or name.endswith(".nfo"):
                 full_path = os.path.join(root, name)
                 rel_path = os.path.relpath(full_path, MOVIES_DIR)
                 if rel_path not in active_files:
