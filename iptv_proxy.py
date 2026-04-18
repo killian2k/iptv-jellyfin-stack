@@ -205,8 +205,17 @@ def play_vod(vod_id, ext):
         if cmd_val.startswith('ffmpeg '): cmd_val = cmd_val[7:]
         
         url = cmd_val.replace(f"[{ext}]", ext)
-        logging.info(f"Redirecting VOD {vod_id} to {url}")
-        return redirect(url, code=302)
+        
+        try:
+            # Resolve the final redirect using the correct User-Agent so Jellyfin doesn't have to
+            r = requests.get(url, headers=headers, allow_redirects=False, stream=True, timeout=10)
+            final_url = r.headers.get('Location', url)
+        except Exception as e:
+            logging.error(f"Failed to resolve VOD redirect: {e}")
+            final_url = url
+            
+        logging.info(f"Redirecting VOD {vod_id} to final URL: {final_url}")
+        return redirect(final_url, code=302)
     except Exception as e:
         logging.error(f"VOD Play error: {e}")
         return f"Error: {e}", 500
