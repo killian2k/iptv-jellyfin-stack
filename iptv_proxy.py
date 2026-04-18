@@ -190,6 +190,7 @@ def play(ch_id):
 @app.route('/vod/<vod_id>.<ext>', methods=['GET', 'HEAD', 'OPTIONS'])
 def play_vod(vod_id, ext):
     if request.method == 'OPTIONS': return Response()
+    if request.method == 'HEAD': return Response(content_type=f'video/{ext}')
     token = handshake()
     if not token: return "Handshake failed", 500
     
@@ -207,15 +208,36 @@ def play_vod(vod_id, ext):
         url = cmd_val.replace(f"[{ext}]", ext)
         
         try:
-            # Resolve the final redirect using the correct User-Agent so Jellyfin doesn't have to
             r = requests.get(url, headers=headers, allow_redirects=False, stream=True, timeout=10)
             final_url = r.headers.get('Location', url)
         except Exception as e:
             logging.error(f"Failed to resolve VOD redirect: {e}")
             final_url = url
             
-        logging.info(f"Redirecting VOD {vod_id} to final URL: {final_url}")
-        return redirect(final_url, code=302)
+        logging.info(f"Proxying VOD {vod_id} from final URL: {final_url}")
+        
+        # Add client Range header for seeking
+        req_headers = headers.copy()
+        if request.headers.get('Range'):
+            req_headers['Range'] = request.headers.get('Range')
+            
+        upstream = requests.get(final_url, headers=req_headers, stream=True, timeout=30)
+        
+        def generate():
+            try:
+                for chunk in upstream.iter_content(chunk_size=128*1024):
+                    if chunk: yield chunk
+            except Exception as e: logging.error(f"VOD Stream error: {e}")
+            
+        proxy_resp = Response(stream_with_context(generate()), status=upstream.status_code)
+        
+        # Pass critical headers to allow native playback and seeking
+        for key in ['Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges']:
+            if key in upstream.headers:
+                proxy_resp.headers[key] = upstream.headers[key]
+                
+        return proxy_resp
+        
     except Exception as e:
         logging.error(f"VOD Play error: {e}")
         return f"Error: {e}", 500
