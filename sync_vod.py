@@ -54,10 +54,15 @@ def parse_vod(name):
         
     return base_name, quality, rank
 
+def unaccent(text):
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize('NFD', text) if unicodedata.category(c) != 'Mn')
+
 def sanitize_folder(name):
     # Remove |FR|, |QC|, etc. and trim
     clean = re.sub(r'^\|[^\|]+\|\s*', '', name).strip()
-    return re.sub(r'[\\/*?:"<>|]', "", clean).strip()
+    clean = re.sub(r'[\\/*?:"<>|]', "", clean).strip()
+    return unaccent(clean)
 
 GENERIC_CATEGORIES = ["NOUVEAUTÉS", "TOP 100", "FILMS DE NOËL", "4K HDR | SDR", "4K DOLBY VISION", "4K HDR10+", "HEVC | X265", "FILMS SD | WEBRIP | HDCAM", "V.O SOUS TITRÉS"]
 
