@@ -1,4 +1,4 @@
-from flask import Flask, Response, stream_with_context, request
+from flask import Flask, Response, stream_with_context, request, redirect
 import requests
 import logging
 import time
@@ -11,8 +11,8 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-BASE_URL = "http://your-provider.com:8000/server/load.php"
-MAC = "00:00:00:00:00:00"
+BASE_URL = "http://pure-ott.com:8000/server/load.php"
+MAC = "00:1A:79:3F:6E:5a"
 UA = "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/531.2+ (KHTML, like Gecko) Version/4.0 Safari/531.2+ STB/MAG256"
 PROXY_BASE = "http://192.168.1.100/iptv"
 
@@ -82,7 +82,6 @@ def get_category_info(name):
     else:
         tags.append("Entertainment")
         
-    # Jellyfin uses ';' to split multiple categories in group-title
     return ";".join(tags), xml_cat
 
 def update_cache():
@@ -110,7 +109,6 @@ def update_cache():
             if item["logo"]: xmltv += f'<icon src="{item["logo"]}" />'
             xmltv += '</channel>\n'
             
-        # Use utcnow() instead of local now() to prevent Jellyfin from ignoring timezone offsets
         now = datetime.utcnow()
         start = now.replace(minute=0, second=0, microsecond=0)
         for item in processed:
@@ -192,7 +190,6 @@ def play(ch_id):
 @app.route('/vod/<vod_id>.<ext>', methods=['GET', 'HEAD', 'OPTIONS'])
 def play_vod(vod_id, ext):
     if request.method == 'OPTIONS': return Response()
-    if request.method == 'HEAD': return Response(content_type=f'video/{ext}')
     token = handshake()
     if not token: return "Handshake failed", 500
     
@@ -207,19 +204,9 @@ def play_vod(vod_id, ext):
         cmd_val = js.get('cmd', '')
         if cmd_val.startswith('ffmpeg '): cmd_val = cmd_val[7:]
         
-        # Clean the URL. Sometimes the provider sends [ext] which needs to be replaced.
         url = cmd_val.replace(f"[{ext}]", ext)
-        
-        logging.info(f"Proxying VOD {vod_id} via {url}")
-        upstream = requests.get(url, headers=headers, stream=True, timeout=30)
-        
-        def generate():
-            try:
-                for chunk in upstream.iter_content(chunk_size=1024*1024):
-                    if chunk: yield chunk
-            except Exception as e: logging.error(f"VOD Stream error: {e}")
-        
-        return Response(stream_with_context(generate()), content_type=f'video/{ext}', headers={'Connection': 'keep-alive'}, direct_passthrough=True)
+        logging.info(f"Redirecting VOD {vod_id} to {url}")
+        return redirect(url, code=302)
     except Exception as e:
         logging.error(f"VOD Play error: {e}")
         return f"Error: {e}", 500
