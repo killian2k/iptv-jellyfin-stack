@@ -157,7 +157,6 @@ def xmltv():
 def play(ch_id):
     if request.method == 'OPTIONS': return Response()
     cid = ch_id.replace('.ts', '')
-    if request.method == 'HEAD': return Response(content_type='video/mp2t')
     token = handshake()
     ch_data = next((c for c in cache["channels"] if str(c.get('id')) == cid), None)
     if not ch_data: return "Not found", 404
@@ -176,6 +175,14 @@ def play(ch_id):
         logging.info(f"Proxying CID {cid} via {final_url}")
         upstream = requests.get(final_url, headers=headers, stream=True, timeout=30)
         
+        if request.method == 'HEAD':
+            proxy_resp = Response(status=upstream.status_code)
+            for key in ['Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges']:
+                if key in upstream.headers:
+                    proxy_resp.headers[key] = upstream.headers[key]
+            upstream.close()
+            return proxy_resp
+        
         def generate():
             try:
                 for chunk in upstream.iter_content(chunk_size=128*1024):
@@ -190,7 +197,6 @@ def play(ch_id):
 @app.route('/vod/<vod_id>.<ext>', methods=['GET', 'HEAD', 'OPTIONS'])
 def play_vod(vod_id, ext):
     if request.method == 'OPTIONS': return Response()
-    if request.method == 'HEAD': return Response(content_type=f'video/{ext}')
     token = handshake()
     if not token: return "Handshake failed", 500
     
@@ -223,11 +229,46 @@ def play_vod(vod_id, ext):
             
         upstream = requests.get(final_url, headers=req_headers, stream=True, timeout=30)
         
+        if request.method == 'HEAD':
+            proxy_resp = Response(status=upstream.status_code)
+            for key in ['Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges']:
+                if key in upstream.headers:
+                    proxy_resp.headers[key] = upstream.headers[key]
+            upstream.close()
+            return proxy_resp
+            
         def generate():
-            try:
-                for chunk in upstream.iter_content(chunk_size=128*1024):
-                    if chunk: yield chunk
-            except Exception as e: logging.error(f"VOD Stream error: {e}")
+            bytes_yielded = 0
+            max_retries = 10
+            current_response = upstream
+            
+            while max_retries > 0:
+                try:
+                    for chunk in current_response.iter_content(chunk_size=128*1024):
+                        if chunk:
+                            yield chunk
+                            bytes_yielded += len(chunk)
+                    break # Finished successfully
+                except GeneratorExit:
+                    break # Client disconnected
+                except Exception as e:
+                    logging.error(f"VOD Stream interrupted at {bytes_yielded} bytes: {e}. Reconnecting...")
+                    max_retries -= 1
+                    time.sleep(1)
+                    
+                    try:
+                        current_headers = req_headers.copy()
+                        orig_start = 0
+                        if 'Range' in req_headers:
+                            match = re.search(r'bytes=(\d+)-', req_headers['Range'])
+                            if match: orig_start = int(match.group(1))
+                        new_start = orig_start + bytes_yielded
+                        current_headers['Range'] = f'bytes={new_start}-'
+                        
+                        current_response = requests.get(final_url, headers=current_headers, stream=True, timeout=15)
+                        current_response.raise_for_status()
+                    except Exception as re_err:
+                        logging.error(f"Failed to reconnect: {re_err}")
             
         proxy_resp = Response(stream_with_context(generate()), status=upstream.status_code)
         

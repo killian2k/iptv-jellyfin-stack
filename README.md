@@ -24,3 +24,14 @@ This repository contains the configuration and custom proxy scripts to securely 
 
 ## Security Note
 Make sure your environment variables (e.g., VPN credentials, API keys) are configured securely on your host before deploying the stack. No passwords or MAC addresses are hardcoded in this repo.
+
+## Troubleshooting
+
+### VOD Playback Crashing on Web Browsers
+If Jellyfin silently drops playback of `.strm` VODs with an FFmpeg `Function not implemented` or `Invalid argument` error related to `av1_vaapi` hardware encoding, it means your GPU lacks native AV1 encoding support. 
+
+To fix this:
+1. Open `/config/encoding.xml` in your Jellyfin data directory.
+2. Find the `<AllowAv1Encoding>true</AllowAv1Encoding>` tag.
+3. Change it to `<AllowAv1Encoding>false</AllowAv1Encoding>`.
+4. Restart the Jellyfin container. This forces Jellyfin to fall back to highly compatible H264 encoding for browsers.
