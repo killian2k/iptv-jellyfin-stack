@@ -50,28 +50,18 @@ def handshake():
         return cache["token"]
 
 def get_stream_link(stream_type, cmd_val, ch_id):
-    """Smart Fallback: Try Passive (MAC only) first, then Active (Token)."""
-    # 1. Try PASSIVE (No token, uses MAC cookie)
     headers = {"Cookie": f"mac={MAC}; stb_lang=en; timezone={USER_TIMEZONE};", "User-Agent": UA, "X-User-Agent": "Model: MAG256; Link: WiFi"}
     try:
-        logging.info(f"Attempting PASSIVE link generation for {stream_type} {ch_id}...")
         resp = requests.get(BASE_URL, params={"type": stream_type, "action": "create_link", "cmd": cmd_val}, headers=headers, timeout=20).json()
         link = resp.get('js', {}).get('cmd', '')
-        if link:
-            logging.info(f"PASSIVE Success for {ch_id}")
-            return link, headers
+        if link: return link, headers
     except: pass
-
-    # 2. Fallback to ACTIVE (Requires Token)
-    logging.warning(f"Passive failed for {ch_id}, falling back to ACTIVE mode.")
     token = handshake()
     headers["Authorization"] = f"Bearer {token}"
     try:
         resp = requests.get(BASE_URL, params={"type": stream_type, "action": "create_link", "cmd": cmd_val}, headers=headers, timeout=20).json()
         return resp.get('js', {}).get('cmd', ''), headers
-    except Exception as e:
-        logging.error(f"Active fallback failed: {e}")
-        return None, headers
+    except: return None, headers
 
 def clean_name(name):
     clean = re.sub(r'\|[^\|]+\|', '', name)
@@ -209,35 +199,33 @@ def play(ch_id):
     ch_data = next((c for c in cache["channels"] if str(c.get('id')) == cid), None)
     if not ch_data: return "Not found", 404
     
-    cmd_val, active_headers = get_stream_link("itv", ch_data.get('cmd'), cid)
-    if not cmd_val: return "Link generation failed", 500
-    
-    try:
-        if cmd_val.startswith('ffmpeg '): cmd_val = cmd_val[7:]
-        parts = cmd_val.split('?')[0].split('/')
-        token_part = cmd_val.split('play_token=')[-1]
-        base_url = '/'.join(parts[:3])
-        final_url = f"{base_url}/{parts[3]}/{parts[4]}/{parts[-1]}?play_token={token_part}"
-        
-        logging.info(f"Proxying CID {cid} via {final_url}")
-        upstream = requests.get(final_url, headers=active_headers, stream=True, timeout=30)
-        
-        if request.method == 'HEAD':
-            proxy_resp = Response(status=upstream.status_code)
-            for key in ['Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges']:
-                if key in upstream.headers: proxy_resp.headers[key] = upstream.headers[key]
-            upstream.close()
-            return proxy_resp
+    def generate():
+        max_retries = 50 # Aggressive infinite-style retry
+        while max_retries > 0:
+            cmd_val, active_headers = get_stream_link("itv", ch_data.get('cmd'), cid)
+            if not cmd_val:
+                logging.error(f"Failed to get link for {cid}")
+                break
             
-        def generate():
             try:
-                for chunk in upstream.iter_content(chunk_size=128*1024):
-                    if chunk: yield chunk
-            except Exception as e: logging.error(f"Stream error: {e}")
-        return Response(stream_with_context(generate()), content_type='video/mp2t', headers={'Connection': 'keep-alive'}, direct_passthrough=True)
-    except Exception as e:
-        logging.error(f"Play error: {e}")
-        return f"Error: {e}", 500
+                if cmd_val.startswith('ffmpeg '): cmd_val = cmd_val[7:]
+                parts = cmd_val.split('?')[0].split('/')
+                token_part = cmd_val.split('play_token=')[-1]
+                base_url = '/'.join(parts[:3])
+                final_url = f"{base_url}/{parts[3]}/{parts[4]}/{parts[-1]}?play_token={token_part}"
+                
+                logging.info(f"Streaming CID {cid} via {final_url} (Retries left: {max_retries})")
+                with requests.get(final_url, headers=active_headers, stream=True, timeout=30) as upstream:
+                    for chunk in upstream.iter_content(chunk_size=128*1024):
+                        if chunk: yield chunk
+                logging.warning(f"Connection dropped for {cid}. Reconnecting...")
+            except GeneratorExit: break
+            except Exception as e:
+                logging.error(f"Stream interrupted for {cid}: {e}. Retrying in 1s...")
+                time.sleep(1)
+            max_retries -= 1
+
+    return Response(stream_with_context(generate()), content_type='video/mp2t', headers={'Connection': 'keep-alive'}, direct_passthrough=True)
 
 @app.route('/vod/<vod_id>.<ext>', methods=['GET', 'HEAD', 'OPTIONS'])
 def play_vod(vod_id, ext):
@@ -245,64 +233,40 @@ def play_vod(vod_id, ext):
     cmd_data = {"type": "movie", "stream_id": str(vod_id), "stream_source": None, "target_container": f'["{ext}"]'}
     cmd_b64 = base64.b64encode(json.dumps(cmd_data).encode()).decode()
     
-    cmd_val, active_headers = get_stream_link("vod", cmd_b64, vod_id)
-    if not cmd_val: return "VOD Link generation failed", 500
-
-    try:
-        if cmd_val.startswith('ffmpeg '): cmd_val = cmd_val[7:]
-        url = cmd_val.replace(f"[{ext}]", ext)
-        try:
-            r = requests.get(url, headers=active_headers, allow_redirects=False, stream=True, timeout=10)
-            final_url = r.headers.get('Location', url)
-        except: final_url = url
-        
-        logging.info(f"Proxying VOD {vod_id} from final URL: {final_url}")
-        req_headers = active_headers.copy()
-        if request.headers.get('Range'): req_headers['Range'] = request.headers.get('Range')
-        upstream = requests.get(final_url, headers=req_headers, stream=True, timeout=30)
-        
-        if request.method == 'HEAD':
-            proxy_resp = Response(status=upstream.status_code)
-            for key in ['Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges']:
-                if key in upstream.headers: proxy_resp.headers[key] = upstream.headers[key]
-            upstream.close()
-            return proxy_resp
+    def generate():
+        max_retries = 20
+        bytes_yielded = 0
+        while max_retries > 0:
+            cmd_val, active_headers = get_stream_link("vod", cmd_b64, vod_id)
+            if not cmd_val: break
             
-        def generate():
-            bytes_yielded = 0
-            max_retries = 10
-            current_response = upstream
-            while max_retries > 0:
+            try:
+                if cmd_val.startswith('ffmpeg '): cmd_val = cmd_val[7:]
+                url = cmd_val.replace(f"[{ext}]", ext)
                 try:
-                    for chunk in current_response.iter_content(chunk_size=128*1024):
+                    r = requests.get(url, headers=active_headers, allow_redirects=False, stream=True, timeout=10)
+                    final_url = r.headers.get('Location', url)
+                except: final_url = url
+                
+                req_headers = active_headers.copy()
+                if bytes_yielded > 0:
+                    req_headers['Range'] = f'bytes={bytes_yielded}-'
+                elif request.headers.get('Range'):
+                    req_headers['Range'] = request.headers.get('Range')
+
+                with requests.get(final_url, headers=req_headers, stream=True, timeout=30) as upstream:
+                    for chunk in upstream.iter_content(chunk_size=128*1024):
                         if chunk:
                             yield chunk
                             bytes_yielded += len(chunk)
-                    break
-                except GeneratorExit: break
-                except Exception as e:
-                    logging.error(f"VOD Stream interrupted at {bytes_yielded} bytes: {e}. Reconnecting...")
-                    max_retries -= 1
-                    time.sleep(1)
-                    try:
-                        current_headers = req_headers.copy()
-                        orig_start = 0
-                        if 'Range' in req_headers:
-                            match = re.search(r'bytes=(\d+)-', req_headers['Range'])
-                            if match: orig_start = int(match.group(1))
-                        new_start = orig_start + bytes_yielded
-                        current_headers['Range'] = f'bytes={new_start}-'
-                        current_response = requests.get(final_url, headers=current_headers, stream=True, timeout=15)
-                        current_response.raise_for_status()
-                    except: pass
+                break # VOD finished normally
+            except GeneratorExit: break
+            except Exception as e:
+                logging.error(f"VOD interrupted: {e}. Resuming from {bytes_yielded}...")
+                max_retries -= 1
+                time.sleep(1)
         
-        proxy_resp = Response(stream_with_context(generate()), status=upstream.status_code)
-        for key in ['Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges']:
-            if key in upstream.headers: proxy_resp.headers[key] = upstream.headers[key]
-        return proxy_resp
-    except Exception as e:
-        logging.error(f"VOD Play error: {e}")
-        return f"Error: {e}", 500
+    return Response(stream_with_context(generate()), content_type='video/mp4', headers={'Connection': 'keep-alive'}, direct_passthrough=True)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8081, threaded=True)
