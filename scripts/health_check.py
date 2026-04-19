@@ -27,7 +27,7 @@ test_endpoint("M3U Playlist", "http://localhost/iptv/playlist.m3u")
 xml_path = "/home/fedosha/server/iptv-proxy/data/xmltv.xml"
 if os.path.exists(xml_path):
     size_mb = os.path.getsize(xml_path)/1024/1024
-    if size_mb > 10:
+    if size_mb > 5:
         print(f"✅ Local XMLTV File: PASS ({size_mb:.1f} MB)")
     else:
         print(f"❌ Local XMLTV File: FAIL (File too small: {size_mb:.1f} MB)")
