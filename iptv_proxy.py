@@ -15,19 +15,21 @@ from zoneinfo import ZoneInfo
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-BASE_URL = "http://your-provider.com:8000/server/load.php"
-MAC = "00:00:00:00:00:00"
-UA = "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/531.2+ (KHTML, like Gecko) Version/4.0 Safari/531.2+ STB/MAG256"
+# CONFIGURATION
+BASE_URL = os.getenv("IPTV_PROVIDER_URL", "http://your-provider.com:8000/server/load.php")
+MAC = os.getenv("IPTV_MAC_ADDRESS", "00:00:00:00:00:00")
+UA = os.getenv("IPTV_USER_AGENT", "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/531.2+ (KHTML, like Gecko) Version/4.0 Safari/531.2+ STB/MAG256")
+PROXY_BASE = os.getenv("IPTV_PROXY_BASE", "http://192.168.1.100/iptv")
+XMLTV_PATH = os.getenv("IPTV_XMLTV_PATH", "/app/data/xmltv.xml")
+USER_TIMEZONE = os.getenv("IPTV_TIMEZONE", "Europe/Zurich")
+DAD_BRIDGE_URL = os.getenv("DAD_BRIDGE_URL", "http://nas2.tailae47e1.ts.net:3128")
+
 STB_HEADERS = {
     "User-Agent": UA,
     "X-User-Agent": "Model: MAG256; Link: WiFi",
     "Accept": "*/*",
     "Connection": "Keep-Alive"
 }
-
-PROXY_BASE = "http://192.168.1.100/iptv"
-XMLTV_PATH = "/app/data/xmltv.xml"
-USER_TIMEZONE = "Europe/Zurich"
 
 cache = {"channels": [], "playlist": None, "xmltv": None, "token": None, "token_time": 0}
 cache_lock = threading.Lock()
@@ -47,18 +49,21 @@ def handshake():
         except: pass
         return cache["token"]
 
-def get_stream_link(stream_type, cmd_val, ch_id):
+def get_stream_link(stream_type, cmd_val, ch_id, use_bridge=False):
     headers = STB_HEADERS.copy()
     headers["Cookie"] = f"mac={MAC}; stb_lang=en; timezone={USER_TIMEZONE};"
+    proxies = {"http": DAD_BRIDGE_URL, "https": DAD_BRIDGE_URL} if use_bridge and DAD_BRIDGE_URL else None
     try:
-        resp = requests.get(BASE_URL, params={"type": stream_type, "action": "create_link", "cmd": cmd_val}, headers=headers, timeout=20).json()
+        resp = requests.get(BASE_URL, params={"type": stream_type, "action": "create_link", "cmd": cmd_val}, 
+                            headers=headers, proxies=proxies, timeout=20).json()
         link = resp.get('js', {}).get('cmd', '')
         if link: return link, headers
     except: pass
     token = handshake()
     headers["Authorization"] = f"Bearer {token}"
     try:
-        resp = requests.get(BASE_URL, params={"type": stream_type, "action": "create_link", "cmd": cmd_val}, headers=headers, timeout=20).json()
+        resp = requests.get(BASE_URL, params={"type": stream_type, "action": "create_link", "cmd": cmd_val}, 
+                            headers=headers, proxies=proxies, timeout=20).json()
         return resp.get('js', {}).get('cmd', ''), headers
     except: return None, headers
 
@@ -168,9 +173,11 @@ def play(ch_id):
     def generate():
         last_url, last_headers, fail_count = None, None, 0
         leftover = b'' 
-        while fail_count < 10:
+        use_bridge = False
+        
+        while fail_count < 20:
             if not last_url:
-                cmd_val, last_headers = get_stream_link("itv", ch_data.get('cmd'), cid)
+                cmd_val, last_headers = get_stream_link("itv", ch_data.get('cmd'), cid, use_bridge=use_bridge)
                 if not cmd_val:
                     fail_count += 1; time.sleep(1); continue
                 if cmd_val.startswith('ffmpeg '): cmd_val = cmd_val[7:]
@@ -178,11 +185,12 @@ def play(ch_id):
                 last_url = f"{'/'.join(parts[:3])}/{parts[3]}/{parts[4]}/{parts[-1]}?play_token={cmd_val.split('play_token=')[-1]}"
 
             try:
-                logging.info(f"Stream Start for {cid}")
-                with requests.get(last_url, headers=last_headers, stream=True, timeout=15) as upstream:
+                logging.info(f"Stream Start for {cid} (Mode: {'BRIDGE' if use_bridge else 'LOCAL'})")
+                start_time = time.time()
+                proxies = {"http": DAD_BRIDGE_URL, "https": DAD_BRIDGE_URL} if use_bridge else None
+                with requests.get(last_url, headers=last_headers, proxies=proxies, stream=True, timeout=15) as upstream:
                     if upstream.status_code == 403:
                         last_url, fail_count = None, fail_count + 1; continue
-                    
                     fail_count = 0
                     for chunk in upstream.iter_content(chunk_size=256*1024):
                         if chunk:
@@ -192,18 +200,20 @@ def play(ch_id):
                             leftover = data[align_idx:]
                             if to_send: yield to_send
                     
-                    logging.warning(f"Connection ended for {cid}. Re-linking...")
+                    duration = time.time() - start_time
+                    logging.warning(f"Connection ended for {cid} after {duration:.1f}s.")
+                    if not use_bridge and duration < 130:
+                        logging.warning("SESSION CONFLICT DETECTED. ACTIVATING GHOST BRIDGE...")
+                        use_bridge = True
                     last_url = None 
             except GeneratorExit: break
-            except Exception as e:
-                logging.error(f"Stream Error for {cid}: {e}. Retrying...")
+            except Exception:
                 last_url, fail_count = None, fail_count + 1
                 time.sleep(random.uniform(0.5, 2.0))
 
     return Response(stream_with_context(generate()), content_type='video/mp2t', direct_passthrough=True)
 
 if __name__ == '__main__':
-    # Initialize cache immediately before starting the server
     update_cache()
     threading.Thread(target=background_worker, daemon=True).start()
     app.run(host='0.0.0.0', port=8081, threaded=True)
