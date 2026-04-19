@@ -6,8 +6,8 @@ import threading
 import re
 import json
 import base64
+import os
 import xml.etree.ElementTree as ET
-from xml.dom import minidom
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
@@ -17,11 +17,14 @@ BASE_URL = "http://your-provider.com:8000/server/load.php"
 MAC = "00:00:00:00:00:00"
 UA = "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/531.2+ (KHTML, like Gecko) Version/4.0 Safari/531.2+ STB/MAG256"
 PROXY_BASE = "http://192.168.1.100/iptv"
+# Write XMLTV to local disk for Jellyfin to read directly
+XMLTV_PATH = "/app/data/xmltv.xml"
 
 cache = {
     "token": None,
     "token_time": 0,
     "channels": [],
+    "epg_data": {},
     "playlist": None,
     "xmltv": None,
     "last_update": 0
@@ -53,96 +56,105 @@ def clean_name(name):
 def get_category_info(name):
     name_upper = name.upper()
     if any(x in name_upper for x in ["---", "▼", "▲", "●", "★"]): return None, None
-    
     country = "Global"
     if "|FR|" in name_upper: country = "FR"
     elif "|US|" in name_upper or "USA:" in name_upper: country = "US"
     elif "|UK|" in name_upper: country = "UK"
     elif "|CA|" in name_upper or "|QC|" in name_upper: country = "CA"
-    
     is_sport = any(x in name_upper for x in ["SPORT", "BEIN", "RMC", "EUROSPORT", "DAZN", "EQUIPE", "GOLF", "FOOT", "ELEVEN", "NBA", "ESPN", "TNT US", "FS1", "FS2", "NBCS", "GOLTV"])
     is_cinema = any(x in name_upper for x in ["CANAL+", "CINE+", "OCS", "MOVIE", "FILM", "CINEMA"])
     is_news = any(x in name_upper for x in ["NEWS", "INFO", "BFM", "CNEWS", "LCI", "CNN", "BBC", "FOX NEWS", "MSNBC"])
     is_kids = any(x in name_upper for x in ["KIDS", "DISNEY", "NICKELODEON", "CARTOON", "GULLI", "PIWI", "BOOMERANG"])
-    
     tags = [country]
     xml_cat = "Entertainment"
-    
-    if is_sport: 
-        tags.append("Sports")
-        xml_cat = "Sports"
-    elif is_cinema: 
-        tags.append("Movies")
-        xml_cat = "Movies"
-    elif is_news:
-        tags.append("News")
-        xml_cat = "News"
-    elif is_kids:
-        tags.append("Kids")
-        xml_cat = "Kids"
-    else:
-        tags.append("Entertainment")
-        
+    if is_sport: tags.append("Sports"); xml_cat = "Sports"
+    elif is_cinema: tags.append("Movies"); xml_cat = "Movies"
+    elif is_news: tags.append("News"); xml_cat = "News"
+    elif is_kids: tags.append("Kids"); xml_cat = "Kids"
+    else: tags.append("Entertainment")
     return ";".join(tags), xml_cat
+
+def indent(elem, level=0):
+    i = "\n" + level*"  "
+    if len(elem):
+        if not elem.text or not elem.text.strip(): elem.text = i + "  "
+        if not elem.tail or not elem.tail.strip(): elem.tail = i
+        for elem in elem: indent(elem, level+1)
+        if not elem.tail or not elem.tail.strip(): elem.tail = i
+    else:
+        if level and (not elem.tail or not elem.tail.strip()): elem.tail = i
 
 def update_cache():
     token = handshake()
     if not token: return
-    headers = {"Cookie": f"mac={MAC}; stb_lang=en; timezone=Europe/Paris;", "User-Agent": UA, "Authorization": f"Bearer {token}"}
+    headers = {"Cookie": f"mac={MAC}; stb_lang=en; timezone=Europe/Paris;", "User-Agent": UA, "Authorization": f"Bearer {token}", "X-User-Agent": "Model: MAG256; Link: WiFi"}
     try:
         resp = requests.get(BASE_URL, params={"type": "itv", "action": "get_all_channels"}, headers=headers, timeout=40)
         channels = resp.json().get('js', {}).get('data', [])
+        epg_map = {}
+        for g_id in ['511', '1468', '1350', '19', '1433']:
+            try:
+                e_resp = requests.get(BASE_URL, params={"type": "itv", "action": "get_epg_info", "genre_id": g_id}, headers=headers, timeout=30).json()
+                if 'js' in e_resp and 'data' in e_resp['js']: epg_map.update(e_resp['js']['data'])
+            except: pass
         processed = []
         m3u = "#EXTM3U\n"
-        
-        # Build XML using ElementTree to handle escaping perfectly
         tv = ET.Element("tv", {"generator-info-name": "IPTV Proxy"})
-        
         for ch in channels:
             group, xml_cat = get_category_info(ch.get('name', ''))
             if not group: continue
             ch_id = str(ch.get('id'))
             display_name = clean_name(ch.get('name', ''))
-            logo = ch.get('logo', '')
-            
-            processed.append({'id': ch_id, 'display_name': display_name, 'group': group, 'xml_cat': xml_cat, 'logo': logo, 'cmd': ch.get('cmd')})
-            
-            # Channel entry
+            processed.append({'id': ch_id, 'display_name': display_name, 'group': group, 'xml_cat': xml_cat, 'logo': ch.get('logo', ''), 'cmd': ch.get('cmd')})
             chan_tag = ET.SubElement(tv, "channel", {"id": ch_id})
             ET.SubElement(chan_tag, "display-name").text = display_name
-            if logo:
-                ET.SubElement(chan_tag, "icon", {"src": logo})
+            if ch.get('logo'): ET.SubElement(chan_tag, "icon", {"src": ch.get('logo')})
         
-        now = datetime.utcnow()
-        start = now.replace(minute=0, second=0, microsecond=0)
-        
+        now_utc = datetime.utcnow()
         for item in processed:
-            # Multi-category M3U
-            m3u += f'#EXTINF:-1 tvg-id="{item["id"]}" tvg-name="{item["display_name"]}" tvg-logo="{item["logo"]}" group-title="{item["group"]}",{item["display_name"]}\n'
-            m3u += f'{PROXY_BASE}/play/{item["id"]}.ts\n'
-            
-            # Generate 12h guide (Smaller file, more stable)
-            for i in range(12):
-                p_start = (start + timedelta(hours=i)).strftime("%Y%m%d%H%M%S +0000")
-                p_end = (start + timedelta(hours=i+1)).strftime("%Y%m%d%H%M%S +0000")
-                
-                prog = ET.SubElement(tv, "programme", {
-                    "start": p_start,
-                    "stop": p_end,
-                    "channel": item["id"]
-                })
-                ET.SubElement(prog, "title", {"lang": "en"}).text = f"Live: {item['display_name']}"
-                ET.SubElement(prog, "desc", {"lang": "en"}).text = f"Live stream for {item['display_name']} on {item['group']}."
-                ET.SubElement(prog, "category", {"lang": "en"}).text = item["xml_cat"]
+            cid = item["id"]
+            m3u += f'#EXTINF:-1 tvg-id="{cid}" tvg-name="{item["display_name"]}" tvg-logo="{item["logo"]}" group-title="{item["group"]}",{item["display_name"]}\n'
+            m3u += f'{PROXY_BASE}/play/{cid}.ts\n'
+            real_progs = epg_map.get(cid, [])
+            if real_progs:
+                real_progs.sort(key=lambda x: int(x['start_timestamp']))
+                first_start = datetime.utcfromtimestamp(int(real_progs[0]['start_timestamp']))
+                bridge_start = (now_utc - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)
+                if bridge_start < first_start:
+                    prog = ET.SubElement(tv, "programme", {"start": bridge_start.strftime("%Y%m%d%H%M%S +0000"), "stop": first_start.strftime("%Y%m%d%H%M%S +0000"), "channel": cid})
+                    ET.SubElement(prog, "title", {"lang": "en"}).text = f"Now: {item['display_name']}"
+                    ET.SubElement(prog, "desc", {"lang": "en"}).text = f"Current programming on {item['display_name']}."
+                    ET.SubElement(prog, "category", {"lang": "en"}).text = item["xml_cat"]
+                for p in real_progs:
+                    try:
+                        p_start = datetime.utcfromtimestamp(int(p['start_timestamp'])).strftime("%Y%m%d%H%M%S +0000")
+                        p_end = datetime.utcfromtimestamp(int(p['stop_timestamp'])).strftime("%Y%m%d%H%M%S +0000")
+                        prog = ET.SubElement(tv, "programme", {"start": p_start, "stop": p_end, "channel": cid})
+                        ET.SubElement(prog, "title", {"lang": "en"}).text = p.get('name', 'Live')
+                        ET.SubElement(prog, "desc", {"lang": "en"}).text = p.get('descr', 'No description available.')
+                        ET.SubElement(prog, "category", {"lang": "en"}).text = item["xml_cat"]
+                    except: pass
+            else:
+                start = (now_utc - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)
+                for i in range(24):
+                    p_start = (start + timedelta(hours=i)).strftime("%Y%m%d%H%M%S +0000")
+                    p_end = (start + timedelta(hours=i+1)).strftime("%Y%m%d%H%M%S +0000")
+                    prog = ET.SubElement(tv, "programme", {"start": p_start, "stop": p_end, "channel": cid})
+                    ET.SubElement(prog, "title", {"lang": "en"}).text = f"Live: {item['display_name']}"
+                    ET.SubElement(prog, "desc", {"lang": "en"}).text = f"Now showing: {item['display_name']}."
+                    ET.SubElement(prog, "category", {"lang": "en"}).text = item["xml_cat"]
 
-        # Serialize XML
+        indent(tv)
         xml_str = ET.tostring(tv, encoding='utf-8', xml_declaration=True).decode('utf-8')
         
+        # WRITE TO LOCAL FILE if path exists
+        if os.path.exists(os.path.dirname(XMLTV_PATH)):
+            with open(XMLTV_PATH, "w", encoding="utf-8") as f:
+                f.write(xml_str)
+            logging.info(f"XMLTV written to local file: {XMLTV_PATH}")
+
         with cache_lock:
-            cache["channels"] = channels
-            cache["playlist"] = m3u
-            cache["xmltv"] = xml_str
-            cache["last_update"] = time.time()
+            cache["channels"], cache["playlist"], cache["xmltv"], cache["last_update"] = channels, m3u, xml_str, time.time()
         logging.info(f"Cache updated: {len(processed)} channels.")
     except Exception as e: logging.error(f"Update error: {e}")
 
@@ -150,7 +162,7 @@ def background_worker():
     while True:
         try: update_cache()
         except: pass
-        time.sleep(12 * 3600)
+        time.sleep(4 * 3600)
 
 threading.Thread(target=background_worker, daemon=True).start()
 
@@ -182,29 +194,23 @@ def play(ch_id):
         js = resp.json().get('js', {})
         cmd_val = js.get('cmd', '')
         if cmd_val.startswith('ffmpeg '): cmd_val = cmd_val[7:]
-        
         parts = cmd_val.split('?')[0].split('/')
         token_part = cmd_val.split('play_token=')[-1]
         base_url = '/'.join(parts[:3])
         final_url = f"{base_url}/{parts[3]}/{parts[4]}/{parts[-1]}?play_token={token_part}"
-        
         logging.info(f"Proxying CID {cid} via {final_url}")
         upstream = requests.get(final_url, headers=headers, stream=True, timeout=30)
-        
         if request.method == 'HEAD':
             proxy_resp = Response(status=upstream.status_code)
             for key in ['Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges']:
-                if key in upstream.headers:
-                    proxy_resp.headers[key] = upstream.headers[key]
+                if key in upstream.headers: proxy_resp.headers[key] = upstream.headers[key]
             upstream.close()
             return proxy_resp
-        
         def generate():
             try:
                 for chunk in upstream.iter_content(chunk_size=128*1024):
                     if chunk: yield chunk
             except Exception as e: logging.error(f"Stream error: {e}")
-        
         return Response(stream_with_context(generate()), content_type='video/mp2t', headers={'Connection': 'keep-alive'}, direct_passthrough=True)
     except Exception as e:
         logging.error(f"Play error: {e}")
@@ -215,63 +221,47 @@ def play_vod(vod_id, ext):
     if request.method == 'OPTIONS': return Response()
     token = handshake()
     if not token: return "Handshake failed", 500
-    
     cmd_data = {"type": "movie", "stream_id": str(vod_id), "stream_source": None, "target_container": f'["{ext}"]'}
     cmd_b64 = base64.b64encode(json.dumps(cmd_data).encode()).decode()
-    
     headers = {"Cookie": f"mac={MAC}; stb_lang=en; timezone=Europe/Paris;", "User-Agent": UA, "Authorization": f"Bearer {token}", "X-User-Agent": "Model: MAG256; Link: WiFi"}
-    
     try:
         resp = requests.get(BASE_URL, params={"type": "vod", "action": "create_link", "cmd": cmd_b64}, headers=headers, timeout=25)
         js = resp.json().get('js', {})
         cmd_val = js.get('cmd', '')
         if cmd_val.startswith('ffmpeg '): cmd_val = cmd_val[7:]
-        
         url = cmd_val.replace(f"[{ext}]", ext)
-        
         try:
             r = requests.get(url, headers=headers, allow_redirects=False, stream=True, timeout=10)
             final_url = r.headers.get('Location', url)
         except Exception as e:
             logging.error(f"Failed to resolve VOD redirect: {e}")
             final_url = url
-            
         logging.info(f"Proxying VOD {vod_id} from final URL: {final_url}")
-        
-        # Add client Range header for seeking
         req_headers = headers.copy()
-        if request.headers.get('Range'):
-            req_headers['Range'] = request.headers.get('Range')
-            
+        if request.headers.get('Range'): req_headers['Range'] = request.headers.get('Range')
         upstream = requests.get(final_url, headers=req_headers, stream=True, timeout=30)
-        
         if request.method == 'HEAD':
             proxy_resp = Response(status=upstream.status_code)
             for key in ['Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges']:
-                if key in upstream.headers:
-                    proxy_resp.headers[key] = upstream.headers[key]
+                if key in upstream.headers: proxy_resp.headers[key] = upstream.headers[key]
             upstream.close()
             return proxy_resp
-            
         def generate():
             bytes_yielded = 0
             max_retries = 10
             current_response = upstream
-            
             while max_retries > 0:
                 try:
                     for chunk in current_response.iter_content(chunk_size=128*1024):
                         if chunk:
                             yield chunk
                             bytes_yielded += len(chunk)
-                    break # Finished successfully
-                except GeneratorExit:
-                    break # Client disconnected
+                    break
+                except GeneratorExit: break
                 except Exception as e:
                     logging.error(f"VOD Stream interrupted at {bytes_yielded} bytes: {e}. Reconnecting...")
                     max_retries -= 1
                     time.sleep(1)
-                    
                     try:
                         current_headers = req_headers.copy()
                         orig_start = 0
@@ -280,21 +270,13 @@ def play_vod(vod_id, ext):
                             if match: orig_start = int(match.group(1))
                         new_start = orig_start + bytes_yielded
                         current_headers['Range'] = f'bytes={new_start}-'
-                        
                         current_response = requests.get(final_url, headers=current_headers, stream=True, timeout=15)
                         current_response.raise_for_status()
-                    except Exception as re_err:
-                        logging.error(f"Failed to reconnect: {re_err}")
-            
+                    except Exception as re_err: logging.error(f"Failed to reconnect: {re_err}")
         proxy_resp = Response(stream_with_context(generate()), status=upstream.status_code)
-        
-        # Pass critical headers to allow native playback and seeking
         for key in ['Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges']:
-            if key in upstream.headers:
-                proxy_resp.headers[key] = upstream.headers[key]
-                
+            if key in upstream.headers: proxy_resp.headers[key] = upstream.headers[key]
         return proxy_resp
-        
     except Exception as e:
         logging.error(f"VOD Play error: {e}")
         return f"Error: {e}", 500

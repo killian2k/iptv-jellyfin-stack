@@ -31,6 +31,7 @@ services:
     restart: unless-stopped
     volumes:
     - ../iptv-proxy/iptv_proxy.py:/app/iptv_proxy.py
+    - /home/fedosha/server/iptv-proxy/data:/app/data
   jellyfin:
     container_name: jellyfin
     devices:
@@ -55,6 +56,7 @@ services:
     - jellyfin-config:/config
     - torrent-downloads:/data
     - torrent-downloaded:/downloaded
+    - /home/fedosha/server/iptv-proxy/data:/iptv_data:ro
   jellyseerr:
     container_name: jellyseerr
     environment:
