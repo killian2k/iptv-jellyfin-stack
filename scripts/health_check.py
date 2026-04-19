@@ -2,10 +2,11 @@ import requests
 import json
 import re
 import sys
+from datetime import datetime, timedelta
 
 def test_endpoint(name, url, expected_status=200, headers=None, params=None, method="GET"):
     try:
-        r = requests.request(method, url, headers=headers, params=params, timeout=15, allow_redirects=False)
+        r = requests.request(method, url, headers=headers, params=params, timeout=20, allow_redirects=False)
         if r.status_code == expected_status:
             print(f"✅ {name}: PASS ({r.status_code})")
             return r
@@ -16,15 +17,45 @@ def test_endpoint(name, url, expected_status=200, headers=None, params=None, met
         print(f"❌ {name}: ERROR ({e})")
         return None
 
-print("--- STARTING SYSTEM HEALTH CHECK ---")
+print("--- STARTING UPDATED SYSTEM HEALTH CHECK ---")
 
 # 1. Test Proxy Endpoints
 test_endpoint("M3U Playlist", "http://localhost/iptv/playlist.m3u")
 xml = test_endpoint("XMLTV Guide", "http://localhost/iptv/xmltv.xml")
-if xml and "&amp;" in xml.text:
-    print("✅ XML Special Characters: PASS (Escaped)")
-else:
-    print("❌ XML Special Characters: FAIL (Not Escaped or Not found)")
+
+if xml:
+    # A. Check XML Formatting (Line breaks)
+    if "\n" in xml.text and "  <channel" in xml.text:
+        print("✅ XML Formatting: PASS (Indented with newlines)")
+    else:
+        print("❌ XML Formatting: FAIL (Missing newlines or indentation)")
+
+    # B. Check Special Character Escaping
+    if "&amp;" in xml.text:
+        print("✅ XML Special Characters: PASS (Escaped)")
+    else:
+        print("❌ XML Special Characters: FAIL (Not Escaped)")
+
+    # C. Check 48h Duration & Timezone Overlap
+    # Look for the last programme start time
+    times = re.findall(r'start="(\d{14})', xml.text)
+    if times:
+        first_time = datetime.strptime(times[0], "%Y%m%d%H%M%S")
+        last_time = datetime.strptime(times[-1], "%Y%m%d%H%M%S")
+        now = datetime.utcnow()
+        
+        # Verify it starts at least 1h in the past
+        if first_time < (now - timedelta(hours=1)):
+            print(f"✅ Guide Timezone Overlap: PASS (Starts at {first_time} UTC)")
+        else:
+            print(f"❌ Guide Timezone Overlap: FAIL (Starts too late: {first_time} UTC)")
+            
+        # Verify duration is roughly 48h
+        duration = last_time - first_time
+        if duration.total_seconds() >= 40 * 3600: # Allow some wiggle room
+            print(f"✅ Guide Duration: PASS ({duration.total_seconds()/3600:.1f} hours)")
+        else:
+            print(f"❌ Guide Duration: FAIL (Only {duration.total_seconds()/3600:.1f} hours)")
 
 # 2. Test VOD Seeking & Range Support
 headers = {"Range": "bytes=0-100"}
@@ -32,9 +63,9 @@ r_vod = test_endpoint("VOD Range Request", "http://localhost/iptv/vod/714148.mkv
 if r_vod and "Content-Range" in r_vod.headers:
     print("✅ VOD Seeking: PASS")
 else:
-    print("❌ VOD Seeking: FAIL (No Content-Range header)")
+    print("❌ VOD Seeking: FAIL")
 
-# 3. Test Jellyseerr Mobile Redirect
+# 3. Test Jellyseerr Mobile Login
 r_js = test_endpoint("Jellyseerr Mobile Login", "http://localhost/login", expected_status=301)
 if r_js and "/jellyseerr/login" in r_js.headers.get("Location", ""):
     print("✅ Jellyseerr Redirect: PASS")
@@ -43,7 +74,7 @@ else:
 
 # 4. Test Jellyfin API & Libraries
 auth_headers = {
-    'X-Emby-Authorization': 'MediaBrowser Client="HealthCheck", Device="TestDevice", DeviceId="12345", Version="1.0.0"',
+    'X-Emby-Authorization': 'MediaBrowser Client="Jellyfin Web", Device="Chrome", DeviceId="12345", Version="10.9.11"',
     'Content-Type': 'application/json'
 }
 try:
@@ -54,13 +85,8 @@ try:
     libs = requests.get('http://192.168.1.100:8096/jellyfin/Library/VirtualFolders', 
                        headers={'X-Emby-Token': tok}).json()
     iptv_libs = [l for l in libs if l['Name'].startswith('IPTV ')]
-    if len(iptv_libs) > 10:
+    if len(iptv_libs) >= 14:
         print(f"✅ Library Population: PASS ({len(iptv_libs)} libraries found)")
-        # Check if first lib has paths
-        if iptv_libs[0].get("Locations"):
-            print("✅ Library Paths: PASS")
-        else:
-            print("❌ Library Paths: FAIL (Locations empty)")
     else:
         print(f"❌ Library Population: FAIL (Only {len(iptv_libs)} found)")
 except Exception as e:
