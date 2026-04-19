@@ -7,6 +7,7 @@ import re
 import json
 import base64
 import os
+import random
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -14,10 +15,19 @@ from zoneinfo import ZoneInfo
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# CONFIGURATION
+# CLOAKED CONFIGURATION
 BASE_URL = "http://your-provider.com:8000/server/load.php"
 MAC = "00:00:00:00:00:00"
 UA = "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/531.2+ (KHTML, like Gecko) Version/4.0 Safari/531.2+ STB/MAG256"
+# Hardware-level headers to mimic a real MAG STB
+STB_HEADERS = {
+    "User-Agent": UA,
+    "X-User-Agent": "Model: MAG256; Link: WiFi",
+    "Accept": "*/*",
+    "Host": "pure-ott.com:8000",
+    "Connection": "Keep-Alive"
+}
+
 PROXY_BASE = "http://192.168.1.100/iptv"
 XMLTV_PATH = "/app/data/xmltv.xml"
 USER_TIMEZONE = "Europe/Zurich"
@@ -36,9 +46,10 @@ cache_lock = threading.Lock()
 def handshake():
     with cache_lock:
         now = time.time()
-        if cache["token"] and (now - cache["token_time"] < 1800):
+        if cache["token"] and (now - cache["token_time"] < 3600):
             return cache["token"]
-        h_headers = {"Cookie": f"mac={MAC}", "User-Agent": UA}
+        h_headers = STB_HEADERS.copy()
+        h_headers["Cookie"] = f"mac={MAC}"
         try:
             resp = requests.get(BASE_URL, params={"type": "stb", "action": "handshake"}, headers=h_headers, timeout=15)
             token = resp.json().get('js', {}).get('token')
@@ -50,12 +61,16 @@ def handshake():
         return cache["token"]
 
 def get_stream_link(stream_type, cmd_val, ch_id):
-    headers = {"Cookie": f"mac={MAC}; stb_lang=en; timezone={USER_TIMEZONE};", "User-Agent": UA, "X-User-Agent": "Model: MAG256; Link: WiFi"}
+    """Passive link generation to avoid session hijacking."""
+    headers = STB_HEADERS.copy()
+    headers["Cookie"] = f"mac={MAC}; stb_lang=en; timezone={USER_TIMEZONE};"
     try:
         resp = requests.get(BASE_URL, params={"type": stream_type, "action": "create_link", "cmd": cmd_val}, headers=headers, timeout=20).json()
         link = resp.get('js', {}).get('cmd', '')
         if link: return link, headers
     except: pass
+    
+    # Minimal active fallback
     token = handshake()
     headers["Authorization"] = f"Bearer {token}"
     try:
@@ -90,19 +105,11 @@ def get_category_info(name):
     else: tags.append("Entertainment")
     return ";".join(tags), xml_cat
 
-def indent(elem, level=0):
-    i = "\n" + level*"  "
-    if len(elem):
-        if not elem.text or not elem.text.strip(): elem.text = i + "  "
-        if not elem.tail or not elem.tail.strip(): elem.tail = i
-        for elem in elem: indent(elem, level+1)
-        if not elem.tail or not elem.tail.strip(): elem.tail = i
-    else:
-        if level and (not elem.tail or not elem.tail.strip()): elem.tail = i
-
 def update_cache():
     token = handshake()
-    headers = {"Cookie": f"mac={MAC}; stb_lang=en; timezone={USER_TIMEZONE};", "User-Agent": UA, "Authorization": f"Bearer {token}", "X-User-Agent": "Model: MAG256; Link: WiFi"}
+    headers = STB_HEADERS.copy()
+    headers["Cookie"] = f"mac={MAC}; stb_lang=en; timezone={USER_TIMEZONE};"
+    headers["Authorization"] = f"Bearer {token}"
     try:
         resp = requests.get(BASE_URL, params={"type": "itv", "action": "get_all_channels"}, headers=headers, timeout=40)
         channels = resp.json().get('js', {}).get('data', [])
@@ -160,14 +167,12 @@ def update_cache():
                     ET.SubElement(prog, "title", {"lang": "en"}).text = f"Live: {item['display_name']}"
                     ET.SubElement(prog, "desc", {"lang": "en"}).text = f"Live stream for {item['display_name']}."
                     ET.SubElement(prog, "category", {"lang": "en"}).text = item["xml_cat"]
-        indent(tv)
         xml_str = ET.tostring(tv, encoding='utf-8', xml_declaration=True).decode('utf-8')
         if os.path.exists(os.path.dirname(XMLTV_PATH)):
             with open(XMLTV_PATH, "w", encoding="utf-8") as f: f.write(xml_str)
         with cache_lock:
             cache["channels"], cache["playlist"], cache["xmltv"], cache["last_update"] = channels, m3u, xml_str, time.time()
-        logging.info(f"Cache updated: {len(processed)} channels.")
-    except Exception as e: logging.error(f"Update error: {e}")
+    except: pass
 
 def background_worker():
     while True:
@@ -176,11 +181,6 @@ def background_worker():
         time.sleep(4 * 3600)
 
 threading.Thread(target=background_worker, daemon=True).start()
-
-@app.after_request
-def add_headers(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    return response
 
 @app.route('/playlist.m3u')
 def playlist():
@@ -192,81 +192,49 @@ def xmltv():
     if not cache["xmltv"]: update_cache()
     return Response(cache["xmltv"], mimetype='text/xml')
 
-@app.route('/play/<ch_id>.ts', methods=['GET', 'HEAD', 'OPTIONS'])
+@app.route('/play/<ch_id>.ts')
 def play(ch_id):
-    if request.method == 'OPTIONS': return Response()
     cid = ch_id.replace('.ts', '')
     ch_data = next((c for c in cache["channels"] if str(c.get('id')) == cid), None)
     if not ch_data: return "Not found", 404
     
     def generate():
-        max_retries = 50 # Aggressive infinite-style retry
-        while max_retries > 0:
-            cmd_val, active_headers = get_stream_link("itv", ch_data.get('cmd'), cid)
-            if not cmd_val:
-                logging.error(f"Failed to get link for {cid}")
-                break
-            
-            try:
+        last_url = None
+        last_headers = None
+        fail_count = 0
+        
+        while fail_count < 20:
+            # CLOAKING: Try reusing the existing link first to be invisible
+            if not last_url:
+                cmd_val, last_headers = get_stream_link("itv", ch_data.get('cmd'), cid)
+                if not cmd_val:
+                    fail_count += 1
+                    time.sleep(2)
+                    continue
                 if cmd_val.startswith('ffmpeg '): cmd_val = cmd_val[7:]
                 parts = cmd_val.split('?')[0].split('/')
                 token_part = cmd_val.split('play_token=')[-1]
-                base_url = '/'.join(parts[:3])
-                final_url = f"{base_url}/{parts[3]}/{parts[4]}/{parts[-1]}?play_token={token_part}"
-                
-                logging.info(f"Streaming CID {cid} via {final_url} (Retries left: {max_retries})")
-                with requests.get(final_url, headers=active_headers, stream=True, timeout=30) as upstream:
-                    for chunk in upstream.iter_content(chunk_size=128*1024):
+                last_url = f"{'/'.join(parts[:3])}/{parts[3]}/{parts[4]}/{parts[-1]}?play_token={token_part}"
+
+            try:
+                logging.info(f"Stealth Stream for {cid} (Attempt {fail_count+1})")
+                with requests.get(last_url, headers=last_headers, stream=True, timeout=15) as upstream:
+                    if upstream.status_code == 403: # Token expired
+                        last_url = None
+                        fail_count += 1
+                        continue
+                    
+                    fail_count = 0 # Reset fails on successful data
+                    for chunk in upstream.iter_content(chunk_size=256*1024):
                         if chunk: yield chunk
-                logging.warning(f"Connection dropped for {cid}. Reconnecting...")
             except GeneratorExit: break
             except Exception as e:
-                logging.error(f"Stream interrupted for {cid}: {e}. Retrying in 1s...")
-                time.sleep(1)
-            max_retries -= 1
+                logging.warning(f"Connection glitch for {cid}. Re-linking silently...")
+                last_url = None # Force a new link generation next loop
+                fail_count += 1
+                time.sleep(random.uniform(0.5, 2.0)) # Smart human-like back-off
 
     return Response(stream_with_context(generate()), content_type='video/mp2t', headers={'Connection': 'keep-alive'}, direct_passthrough=True)
-
-@app.route('/vod/<vod_id>.<ext>', methods=['GET', 'HEAD', 'OPTIONS'])
-def play_vod(vod_id, ext):
-    if request.method == 'OPTIONS': return Response()
-    cmd_data = {"type": "movie", "stream_id": str(vod_id), "stream_source": None, "target_container": f'["{ext}"]'}
-    cmd_b64 = base64.b64encode(json.dumps(cmd_data).encode()).decode()
-    
-    def generate():
-        max_retries = 20
-        bytes_yielded = 0
-        while max_retries > 0:
-            cmd_val, active_headers = get_stream_link("vod", cmd_b64, vod_id)
-            if not cmd_val: break
-            
-            try:
-                if cmd_val.startswith('ffmpeg '): cmd_val = cmd_val[7:]
-                url = cmd_val.replace(f"[{ext}]", ext)
-                try:
-                    r = requests.get(url, headers=active_headers, allow_redirects=False, stream=True, timeout=10)
-                    final_url = r.headers.get('Location', url)
-                except: final_url = url
-                
-                req_headers = active_headers.copy()
-                if bytes_yielded > 0:
-                    req_headers['Range'] = f'bytes={bytes_yielded}-'
-                elif request.headers.get('Range'):
-                    req_headers['Range'] = request.headers.get('Range')
-
-                with requests.get(final_url, headers=req_headers, stream=True, timeout=30) as upstream:
-                    for chunk in upstream.iter_content(chunk_size=128*1024):
-                        if chunk:
-                            yield chunk
-                            bytes_yielded += len(chunk)
-                break # VOD finished normally
-            except GeneratorExit: break
-            except Exception as e:
-                logging.error(f"VOD interrupted: {e}. Resuming from {bytes_yielded}...")
-                max_retries -= 1
-                time.sleep(1)
-        
-    return Response(stream_with_context(generate()), content_type='video/mp4', headers={'Connection': 'keep-alive'}, direct_passthrough=True)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8081, threaded=True)
