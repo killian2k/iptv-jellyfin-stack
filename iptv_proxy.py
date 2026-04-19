@@ -19,7 +19,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 BASE_URL = "http://your-provider.com:8000/server/load.php"
 MAC = "00:00:00:00:00:00"
 UA = "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/531.2+ (KHTML, like Gecko) Version/4.0 Safari/531.2+ STB/MAG256"
-# Hardware-level headers to mimic a real MAG STB
 STB_HEADERS = {
     "User-Agent": UA,
     "X-User-Agent": "Model: MAG256; Link: WiFi",
@@ -31,6 +30,7 @@ STB_HEADERS = {
 PROXY_BASE = "http://192.168.1.100/iptv"
 XMLTV_PATH = "/app/data/xmltv.xml"
 USER_TIMEZONE = "Europe/Zurich"
+TS_PACKET_SIZE = 188 # Standard MPEG-TS packet size
 
 cache = {
     "token": None,
@@ -54,14 +54,12 @@ def handshake():
             resp = requests.get(BASE_URL, params={"type": "stb", "action": "handshake"}, headers=h_headers, timeout=15)
             token = resp.json().get('js', {}).get('token')
             if token:
-                cache["token"] = token
-                cache["token_time"] = now
+                cache["token"], cache["token_time"] = token, now
                 return token
         except: pass
         return cache["token"]
 
 def get_stream_link(stream_type, cmd_val, ch_id):
-    """Passive link generation to avoid session hijacking."""
     headers = STB_HEADERS.copy()
     headers["Cookie"] = f"mac={MAC}; stb_lang=en; timezone={USER_TIMEZONE};"
     try:
@@ -69,8 +67,6 @@ def get_stream_link(stream_type, cmd_val, ch_id):
         link = resp.get('js', {}).get('cmd', '')
         if link: return link, headers
     except: pass
-    
-    # Minimal active fallback
     token = handshake()
     headers["Authorization"] = f"Bearer {token}"
     try:
@@ -182,6 +178,11 @@ def background_worker():
 
 threading.Thread(target=background_worker, daemon=True).start()
 
+@app.after_request
+def add_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
+
 @app.route('/playlist.m3u')
 def playlist():
     if not cache["playlist"]: update_cache()
@@ -199,40 +200,45 @@ def play(ch_id):
     if not ch_data: return "Not found", 404
     
     def generate():
-        last_url = None
-        last_headers = None
-        fail_count = 0
-        
+        last_url, last_headers, fail_count = None, None, 0
+        leftover = b'' # Buffer for non-aligned packets
+
         while fail_count < 20:
-            # CLOAKING: Try reusing the existing link first to be invisible
             if not last_url:
                 cmd_val, last_headers = get_stream_link("itv", ch_data.get('cmd'), cid)
                 if not cmd_val:
                     fail_count += 1
-                    time.sleep(2)
-                    continue
+                    time.sleep(1); continue
                 if cmd_val.startswith('ffmpeg '): cmd_val = cmd_val[7:]
                 parts = cmd_val.split('?')[0].split('/')
                 token_part = cmd_val.split('play_token=')[-1]
                 last_url = f"{'/'.join(parts[:3])}/{parts[3]}/{parts[4]}/{parts[-1]}?play_token={token_part}"
 
             try:
-                logging.info(f"Stealth Stream for {cid} (Attempt {fail_count+1})")
+                logging.info(f"Stealth-Aligned Stream for {cid}")
                 with requests.get(last_url, headers=last_headers, stream=True, timeout=15) as upstream:
-                    if upstream.status_code == 403: # Token expired
-                        last_url = None
-                        fail_count += 1
+                    if upstream.status_code == 403:
+                        last_url, fail_count = None, fail_count + 1
                         continue
                     
-                    fail_count = 0 # Reset fails on successful data
-                    for chunk in upstream.iter_content(chunk_size=256*1024):
-                        if chunk: yield chunk
+                    fail_count = 0
+                    # Standard chunk size 512KB for smooth handover
+                    for chunk in upstream.iter_content(chunk_size=512*1024):
+                        if chunk:
+                            # SEAMLESS ALIGNMENT LOGIC
+                            data = leftover + chunk
+                            # Calculate alignment boundary (188 bytes)
+                            align_idx = (len(data) // TS_PACKET_SIZE) * TS_PACKET_SIZE
+                            to_send = data[:align_idx]
+                            leftover = data[align_idx:]
+                            
+                            if to_send:
+                                yield to_send
             except GeneratorExit: break
             except Exception as e:
-                logging.warning(f"Connection glitch for {cid}. Re-linking silently...")
-                last_url = None # Force a new link generation next loop
-                fail_count += 1
-                time.sleep(random.uniform(0.5, 2.0)) # Smart human-like back-off
+                logging.warning(f"Precision Resume for {cid}. Re-linking...")
+                last_url, fail_count = None, fail_count + 1
+                time.sleep(random.uniform(0.3, 1.0))
 
     return Response(stream_with_context(generate()), content_type='video/mp2t', headers={'Connection': 'keep-alive'}, direct_passthrough=True)
 
