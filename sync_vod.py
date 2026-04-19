@@ -1,8 +1,7 @@
 import os, re, requests, json, time, unicodedata
 
-# CREDENTIALS
-BASE_URL = "http://pure-ott.com:8000/server/load.php"
-MAC = "00:1A:79:3F:6E:5a"
+BASE_URL = "http://your-provider.com:8000/server/load.php"
+MAC = "00:00:00:00:00:00"
 UA = "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/531.2+ (KHTML, like Gecko) Version/4.0 Safari/531.2+ STB/MAG256"
 PROXY_BASE = "http://192.168.1.100/iptv/vod"
 MOVIES_DIR = "/mnt/nvme/MediaLibrary/IPTV_Movies"
@@ -11,18 +10,13 @@ def unaccent(text):
     return "".join(c for c in unicodedata.normalize('NFD', text) if unicodedata.category(c) != 'Mn')
 
 def clean_title(name):
-    # 1. Remove bracketed/piped tags at the start (e.g. |FR|, [FR], (FR))
     clean = re.sub(r'^(\[[^\]]+\]|\|[^\|]+\||\([^\)]+\))\s*', '', name).strip()
-    # 2. Remove specific prefixes like FR, QC, VOSTFR, STFR if followed by space
     clean = re.sub(r'^(FR|QC|VOSTFR|STFR|MULTIAUDIO|MULTI)\s+', '', clean, flags=re.IGNORECASE).strip()
-    # 3. Deduplicate years: (1979) (1979) -> (1979)
     clean = re.sub(r'(\(\d{4}\))\s+\1', r'\1', clean)
-    # 4. Clean up multiple spaces
     clean = re.sub(r'\s+', ' ', clean).strip()
     return clean
 
 def sanitize_filename(name):
-    # Escape for XML and remove illegal chars
     clean = name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     return re.sub(r'[\\/*?:"<>|]', "", clean).strip()
 
@@ -46,7 +40,6 @@ def parse_vod(name):
     return base_name, quality, rank
 
 def handshake():
-    print("Handshaking...")
     try:
         resp = requests.get(BASE_URL, params={"type": "stb", "action": "handshake"}, headers={"Cookie": f"mac={MAC}", "User-Agent": UA}, timeout=10)
         return resp.json()["js"]["token"]
@@ -55,7 +48,7 @@ def handshake():
 def sync_vods():
     token = handshake()
     if not token: return
-    headers = {"Cookie": f"mac={MAC}; stb_lang=en; timezone=Europe/Paris;", "User-Agent": UA, "Authorization": f"Bearer {token}", "X-User-Agent": "Model: MAG256; Link: WiFi"}
+    headers = {"Cookie": f"mac={MAC}; stb_lang=en; timezone=Europe/Zurich;", "User-Agent": UA, "Authorization": f"Bearer {token}", "X-User-Agent": "Model: MAG256; Link: WiFi"}
     
     print("Fetching categories...")
     categories = requests.get(BASE_URL, params={"type": "vod", "action": "get_categories"}, headers=headers, timeout=15).json().get("js", [])
@@ -69,13 +62,13 @@ def sync_vods():
         cat_id, cat_title = cat.get("id"), cat.get("title", "Other")
         if cat_id == "*" or not cat_id: continue
         
-        # Only process FR, QC, VO, ENG, MULTI categories to catch everything the Dad's box has
+        # Only process FR, QC, VO, ENG, MULTI categories
         if not any(tag in cat_title for tag in ["|FR|", "|QC|", "|VO|", "|ENG|", "|MULTI|"]): continue
         
         folder_name = sanitize_folder(cat_title)
         is_fr = "|FR|" in cat_title or "|QC|" in cat_title
         
-        # Specific folder name for Nouveautés as requested
+        # Special naming for Nouveautés
         if "NOUVEAUTE" in folder_name and is_fr:
             target_folder = SPECIAL_FR_NOUVEAUTE
         else:
@@ -88,7 +81,7 @@ def sync_vods():
 
         cat_best_vods = {}
         page = 1
-        while page < 500: # High limit for massive categories
+        while page < 500:
             try:
                 vod_resp = requests.get(BASE_URL, params={"type": "vod", "action": "get_ordered_list", "category": cat_id, "p": page}, headers=headers, timeout=20).json()
                 data = vod_resp.get("js", {}).get("data", [])
@@ -98,9 +91,8 @@ def sync_vods():
                     name, vod_id = vod.get("name", ""), vod.get("id")
                     if not name or not vod_id: continue
                     
-                    base_name, quality, rank = parse_vod(name)
-                    # We store by cleaned title to deduplicate, but keep the highest quality ID
                     cleaned_display_name = clean_title(name)
+                    base_name, quality, rank = parse_vod(name)
                     
                     if cleaned_display_name not in cat_best_vods or rank > cat_best_vods[cleaned_display_name]['rank']:
                         cat_best_vods[cleaned_display_name] = {'id': vod_id, 'name': cleaned_display_name, 'rank': rank}
@@ -109,22 +101,19 @@ def sync_vods():
                 page += 1
             except: break
 
-        # Write files for this category immediately
         for info in cat_best_vods.values():
             safe_filename = sanitize_filename(info['name'])
             filename_base = f"{safe_filename} [{info['id']}]"
             strm_rel, nfo_rel = os.path.join(target_folder, f"{filename_base}.strm"), os.path.join(target_folder, f"{filename_base}.nfo")
             active_files.add(strm_rel); active_files.add(nfo_rel)
             
-            strm_path = os.path.join(MOVIES_DIR, strm_rel)
-            nfo_path = os.path.join(MOVIES_DIR, nfo_rel)
-            
+            strm_path, nfo_path = os.path.join(MOVIES_DIR, strm_rel), os.path.join(MOVIES_DIR, nfo_rel)
             if not os.path.exists(strm_path):
                 with open(strm_path, 'w') as f: f.write(f"{PROXY_BASE}/{info['id']}.mkv\n")
             
-            # Always update NFO to ensure title and collection name are correct
+            collection_name = f"IPTV {target_folder}" if not target_folder.startswith("IPTV") else target_folder
             with open(nfo_path, 'w', encoding='utf-8') as f:
-                f.write('<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n<movie>\n  <title>' + info['name'] + '</title>\n  <set>\n    <name>IPTV ' + target_folder + '</name>\n  </set>\n</movie>\n')
+                f.write('<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n<movie>\n  <title>' + info['name'] + '</title>\n  <set>\n    <name>' + collection_name + '</name>\n  </set>\n</movie>\n')
 
     print("Cleaning up orphans...")
     for root, dirs, files in os.walk(MOVIES_DIR, topdown=False):
