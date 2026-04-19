@@ -49,16 +49,13 @@ def handshake():
         return cache["token"]
 
 def get_stream_link(stream_type, cmd_val, ch_id):
-    """Force HLS/M3U8 mode to bypass connection limits."""
     headers = STB_HEADERS.copy()
     headers["Cookie"] = f"mac={MAC}; stb_lang=en; timezone={USER_TIMEZONE};"
-    # We add the HLS container hint to the provider
     try:
         resp = requests.get(BASE_URL, params={"type": stream_type, "action": "create_link", "cmd": cmd_val, "container": "hls"}, headers=headers, timeout=20).json()
         link = resp.get('js', {}).get('cmd', '')
         if link: return link, headers
     except: pass
-    
     token = handshake()
     headers["Authorization"] = f"Bearer {token}"
     try:
@@ -77,13 +74,15 @@ def get_category_info(name):
     if any(x in name_upper for x in ["---", "▼", "▲", "●", "★"]): return None, None
     country = "Global"
     if "|FR|" in name_upper: country = "FR"
-    elif "|US|" in name_upper or "USA:" in name_upper: country = "US"
+    elif any(x in name_upper for x in ["|US|", "USA:", "(US)", "UNITED STATES"]): country = "US"
     elif "|UK|" in name_upper: country = "UK"
     elif "|CA|" in name_upper or "|QC|" in name_upper: country = "CA"
+    
     is_sport = any(x in name_upper for x in ["SPORT", "BEIN", "RMC", "EUROSPORT", "DAZN", "EQUIPE", "GOLF", "FOOT", "ELEVEN", "NBA", "ESPN", "TNT US", "FS1", "FS2", "NBCS", "GOLTV"])
     is_cinema = any(x in name_upper for x in ["CANAL+", "CINE+", "OCS", "MOVIE", "FILM", "CINEMA"])
     is_news = any(x in name_upper for x in ["NEWS", "INFO", "BFM", "CNEWS", "LCI", "CNN", "BBC", "FOX NEWS", "MSNBC"])
     is_kids = any(x in name_upper for x in ["KIDS", "DISNEY", "NICKELODEON", "CARTOON", "GULLI", "PIWI", "BOOMERANG"])
+    
     tags = [country]; xml_cat = "Entertainment"
     if is_sport: tags.append("Sports"); xml_cat = "Sports"
     elif is_cinema: tags.append("Movies"); xml_cat = "Movies"
@@ -99,19 +98,65 @@ def update_cache():
     headers["Authorization"] = f"Bearer {token}"
     try:
         resp = requests.get(BASE_URL, params={"type": "itv", "action": "get_all_channels"}, headers=headers, timeout=40)
-        channels = resp.json().get('js', {}).get('data', [])
+        channels_data = resp.json().get('js', {}).get('data', [])
+        
+        epg_map = {}
+        genre_ids = ['3', '511', '1469', '1468', '1467', '1433', '1499', '4', '1404', '951', '62', '19', '1350']
+        for g_id in genre_ids:
+            try:
+                e_resp = requests.get(BASE_URL, params={"type": "itv", "action": "get_epg_info", "genre_id": g_id}, headers=headers, timeout=30).json()
+                if 'js' in e_resp and 'data' in e_resp['js']: epg_map.update(e_resp['js']['data'])
+            except: pass
+        
         processed = []
         m3u = "#EXTM3U\n"
         tv = ET.Element("tv", {"generator-info-name": "IPTV Proxy"})
-        for ch in channels:
-            group, xml_cat = get_category_info(ch.get('name', ''))
+        
+        tz = ZoneInfo(USER_TIMEZONE)
+        now = datetime.now(tz)
+
+        for ch in channels_data:
+            name = ch.get('name', '')
+            group, xml_cat = get_category_info(name)
             if not group: continue
+            
             ch_id = str(ch.get('id'))
-            display_name = clean_name(ch.get('name', ''))
-            processed.append({'id': ch_id, 'display_name': display_name, 'group': group, 'xml_cat': xml_cat, 'cmd': ch.get('cmd')})
+            display_name = clean_name(name)
+            logo = ch.get('logo', '')
+            
+            item = {'id': ch_id, 'display_name': display_name, 'group': group, 'xml_cat': xml_cat, 'cmd': ch.get('cmd'), 'logo': logo}
+            processed.append(item)
+            
+            # Build M3U entry
+            m3u += f'#EXTINF:-1 tvg-id=\"{ch_id}\" tvg-name=\"{display_name}\" tvg-logo=\"{logo}\" group-title=\"{group}\", {display_name}\n'
+            m3u += f'{PROXY_BASE}/play/{ch_id}.ts\n'
+
+            # Build XMLTV channel
+            if ch_id in epg_map:
+                chan_tag = ET.SubElement(tv, "channel", {"id": ch_id})
+                ET.SubElement(chan_tag, "display-name").text = display_name
+                if logo: ET.SubElement(chan_tag, "icon", {"src": logo})
+                
+                # Programs
+                real_progs = epg_map.get(ch_id, [])
+                real_progs.sort(key=lambda x: int(x['start_timestamp']))
+                for p in real_progs:
+                    try:
+                        p_start = datetime.fromtimestamp(int(p['start_timestamp']), tz=tz).strftime("%Y%m%d%H%M%S %z")
+                        p_end = datetime.fromtimestamp(int(p['stop_timestamp']), tz=tz).strftime("%Y%m%d%H%M%S %z")
+                        prog = ET.SubElement(tv, "programme", {"start": p_start, "stop": p_end, "channel": ch_id})
+                        ET.SubElement(prog, "title", {"lang": "en"}).text = p.get('name', 'Live')
+                        ET.SubElement(prog, "desc", {"lang": "en"}).text = p.get('descr', 'No description available.')
+                        ET.SubElement(prog, "category", {"lang": "en"}).text = xml_cat
+                    except: pass
+
+        xml_str = ET.tostring(tv, encoding='utf-8', xml_declaration=True).decode('utf-8')
+        if os.path.exists(os.path.dirname(XMLTV_PATH)):
+            with open(XMLTV_PATH, "w", encoding="utf-8") as f: f.write(xml_str)
+            
         with cache_lock:
-            cache["channels"], cache["playlist"], cache["xmltv"] = processed, m3u, ET.tostring(tv).decode()
-        logging.info("Cache update complete.")
+            cache["channels"], cache["playlist"], cache["xmltv"] = processed, m3u, xml_str
+        logging.info(f"Cache update complete: {len(processed)} channels.")
     except Exception as e: logging.error(f"Update error: {e}")
 
 def background_worker():
@@ -123,6 +168,10 @@ def background_worker():
 @app.route('/playlist.m3u')
 def playlist():
     return Response(cache["playlist"], mimetype='audio/x-mpegurl')
+
+@app.route('/xmltv.xml')
+def xmltv():
+    return Response(cache["xmltv"], mimetype='text/xml')
 
 @app.route('/play/<ch_id>.ts')
 def play(ch_id):
@@ -152,7 +201,7 @@ def play(ch_id):
                             to_send = data[:align_idx]
                             leftover = data[align_idx:]
                             if to_send: yield to_send
-                    last_url = None # Force re-link on connection end
+                    last_url = None 
             except GeneratorExit: break
             except Exception:
                 last_url, fail_count = None, fail_count + 1
