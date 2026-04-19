@@ -14,7 +14,6 @@ from zoneinfo import ZoneInfo
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# CONFIGURATION
 BASE_URL = "http://your-provider.com:8000/server/load.php"
 MAC = "00:00:00:00:00:00"
 UA = "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/531.2+ (KHTML, like Gecko) Version/4.0 Safari/531.2+ STB/MAG256"
@@ -26,6 +25,7 @@ cache = {
     "token": None,
     "token_time": 0,
     "channels": [],
+    "epg_data": {},
     "playlist": None,
     "xmltv": None,
     "last_update": 0
@@ -62,12 +62,10 @@ def get_category_info(name):
     elif "|US|" in name_upper or "USA:" in name_upper: country = "US"
     elif "|UK|" in name_upper: country = "UK"
     elif "|CA|" in name_upper or "|QC|" in name_upper: country = "CA"
-    
     is_sport = any(x in name_upper for x in ["SPORT", "BEIN", "RMC", "EUROSPORT", "DAZN", "EQUIPE", "GOLF", "FOOT", "ELEVEN", "NBA", "ESPN", "TNT US", "FS1", "FS2", "NBCS", "GOLTV"])
     is_cinema = any(x in name_upper for x in ["CANAL+", "CINE+", "OCS", "MOVIE", "FILM", "CINEMA"])
     is_news = any(x in name_upper for x in ["NEWS", "INFO", "BFM", "CNEWS", "LCI", "CNN", "BBC", "FOX NEWS", "MSNBC"])
     is_kids = any(x in name_upper for x in ["KIDS", "DISNEY", "NICKELODEON", "CARTOON", "GULLI", "PIWI", "BOOMERANG"])
-    
     tags = [country]
     xml_cat = "Entertainment"
     if is_sport: tags.append("Sports"); xml_cat = "Sports"
@@ -90,12 +88,7 @@ def indent(elem, level=0):
 def update_cache():
     token = handshake()
     if not token: return
-    headers = {
-        "Cookie": f"mac={MAC}; stb_lang=en; timezone={USER_TIMEZONE};",
-        "User-Agent": UA,
-        "Authorization": f"Bearer {token}",
-        "X-User-Agent": "Model: MAG256; Link: WiFi"
-    }
+    headers = {"Cookie": f"mac={MAC}; stb_lang=en; timezone={USER_TIMEZONE};", "User-Agent": UA, "Authorization": f"Bearer {token}", "X-User-Agent": "Model: MAG256; Link: WiFi"}
     try:
         resp = requests.get(BASE_URL, params={"type": "itv", "action": "get_all_channels"}, headers=headers, timeout=40)
         channels = resp.json().get('js', {}).get('data', [])
@@ -105,25 +98,23 @@ def update_cache():
                 e_resp = requests.get(BASE_URL, params={"type": "itv", "action": "get_epg_info", "genre_id": g_id}, headers=headers, timeout=30).json()
                 if 'js' in e_resp and 'data' in e_resp['js']: epg_map.update(e_resp['js']['data'])
             except: pass
-            
         processed = []
         m3u = "#EXTM3U\n"
         tv = ET.Element("tv", {"generator-info-name": "IPTV Proxy"})
-        
         for ch in channels:
             group, xml_cat = get_category_info(ch.get('name', ''))
             if not group: continue
             ch_id = str(ch.get('id'))
             display_name = clean_name(ch.get('name', ''))
-            logo = ch.get('logo', '')
-            processed.append({'id': ch_id, 'display_name': display_name, 'group': group, 'xml_cat': xml_cat, 'logo': logo, 'cmd': ch.get('cmd')})
-            chan_tag = ET.SubElement(tv, "channel", {"id": ch_id})
-            ET.SubElement(chan_tag, "display-name").text = display_name
-            if logo: ET.SubElement(chan_tag, "icon", {"src": logo})
+            processed.append({'id': ch_id, 'display_name': display_name, 'group': group, 'xml_cat': xml_cat, 'logo': ch.get('logo', ''), 'cmd': ch.get('cmd')})
+            
+            if ch_id in epg_map:
+                chan_tag = ET.SubElement(tv, "channel", {"id": ch_id})
+                ET.SubElement(chan_tag, "display-name").text = display_name
+                if ch.get('logo'): ET.SubElement(chan_tag, "icon", {"src": ch.get('logo')})
         
         tz = ZoneInfo(USER_TIMEZONE)
         now = datetime.now(tz)
-        
         for item in processed:
             cid = item["id"]
             m3u += f'#EXTINF:-1 tvg-id="{cid}" tvg-name="{item["display_name"]}" tvg-logo="{item["logo"]}" group-title="{item["group"]}",{item["display_name"]}\n'
@@ -134,13 +125,11 @@ def update_cache():
                 real_progs.sort(key=lambda x: int(x['start_timestamp']))
                 first_start = datetime.fromtimestamp(int(real_progs[0]['start_timestamp']), tz=tz)
                 bridge_start = (now - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)
-                
                 if bridge_start < first_start:
                     prog = ET.SubElement(tv, "programme", {"start": bridge_start.strftime("%Y%m%d%H%M%S %z"), "stop": first_start.strftime("%Y%m%d%H%M%S %z"), "channel": cid})
                     ET.SubElement(prog, "title", {"lang": "en"}).text = f"Now: {item['display_name']}"
                     ET.SubElement(prog, "desc", {"lang": "en"}).text = f"Current programming on {item['display_name']}."
                     ET.SubElement(prog, "category", {"lang": "en"}).text = item["xml_cat"]
-
                 for p in real_progs:
                     try:
                         p_start = datetime.fromtimestamp(int(p['start_timestamp']), tz=tz).strftime("%Y%m%d%H%M%S %z")
@@ -150,15 +139,6 @@ def update_cache():
                         ET.SubElement(prog, "desc", {"lang": "en"}).text = p.get('descr', 'No description available.')
                         ET.SubElement(prog, "category", {"lang": "en"}).text = item["xml_cat"]
                     except: pass
-            else:
-                start_fallback = (now - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)
-                for i in range(24):
-                    p_start = (start_fallback + timedelta(hours=i)).strftime("%Y%m%d%H%M%S %z")
-                    p_end = (start_fallback + timedelta(hours=i+1)).strftime("%Y%m%d%H%M%S %z")
-                    prog = ET.SubElement(tv, "programme", {"start": p_start, "stop": p_end, "channel": cid})
-                    ET.SubElement(prog, "title", {"lang": "en"}).text = f"Live: {item['display_name']}"
-                    ET.SubElement(prog, "desc", {"lang": "en"}).text = f"Now showing: {item['display_name']}."
-                    ET.SubElement(prog, "category", {"lang": "en"}).text = item["xml_cat"]
 
         indent(tv)
         xml_str = ET.tostring(tv, encoding='utf-8', xml_declaration=True).decode('utf-8')
@@ -166,7 +146,7 @@ def update_cache():
             with open(XMLTV_PATH, "w", encoding="utf-8") as f: f.write(xml_str)
         with cache_lock:
             cache["channels"], cache["playlist"], cache["xmltv"], cache["last_update"] = channels, m3u, xml_str, time.time()
-        logging.info(f"Cache updated: {len(processed)} channels with dynamic {USER_TIMEZONE} timezone.")
+        logging.info(f"Cache updated: {len(processed)} channels (EPG optimized).")
     except Exception as e: logging.error(f"Update error: {e}")
 
 def background_worker():

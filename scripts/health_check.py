@@ -23,10 +23,14 @@ print("--- STARTING SYSTEM HEALTH CHECK ---")
 # 1. Test Proxy Endpoints
 test_endpoint("M3U Playlist", "http://localhost/iptv/playlist.m3u")
 
-# 2. Test Local XMLTV File
+# 2. Test Local XMLTV File (Optimization)
 xml_path = "/home/fedosha/server/iptv-proxy/data/xmltv.xml"
 if os.path.exists(xml_path):
-    print(f"✅ Local XMLTV File: PASS ({os.path.getsize(xml_path)/1024/1024:.1f} MB)")
+    size_mb = os.path.getsize(xml_path)/1024/1024
+    if size_mb > 10:
+        print(f"✅ Local XMLTV File: PASS ({size_mb:.1f} MB)")
+    else:
+        print(f"❌ Local XMLTV File: FAIL (File too small: {size_mb:.1f} MB)")
 else:
     print("❌ Local XMLTV File: FAIL (Not found)")
 
@@ -38,7 +42,7 @@ if r_vod and "Content-Range" in r_vod.headers:
 else:
     print("❌ VOD Seeking: FAIL")
 
-# 4. Test Jellyfin API & Programs
+# 4. Test Jellyfin API & Smart EPG
 auth_headers = {
     'X-Emby-Authorization': 'MediaBrowser Client="HealthCheck", Device="Chrome", DeviceId="12345", Version="10.9.11"',
     'Content-Type': 'application/json'
@@ -50,24 +54,25 @@ try:
     tok = res['AccessToken']
     uid = res['User']['Id']
     
-    # Check if programs are populated (should be > 10,000)
+    # Check if programs are populated
     prog = requests.get(f'http://192.168.1.100:8096/jellyfin/LiveTv/Programs?UserId={uid}&HasAired=false&Limit=1', 
                        headers={'X-Emby-Token': tok}).json()
     count = prog.get('TotalRecordCount', 0)
-    if count > 10000:
-        print(f"✅ Guide Data: PASS ({count} programs found)")
+    if count > 5000: # Threshold for optimized guide
+        print(f"✅ Smart Guide Data: PASS ({count} programs found)")
     else:
-        print(f"❌ Guide Data: FAIL (Only {count} programs found)")
+        print(f"❌ Smart Guide Data: FAIL (Only {count} programs found)")
 
-    # Check for real EPG names (not placeholders)
-    prog_real = requests.get(f'http://192.168.1.100:8096/jellyfin/LiveTv/Programs?UserId={uid}&HasAired=false&Limit=50', 
+    # Check for REAL provider data (not just our 'Now:' or 'Live:' fallbacks)
+    # We search the first 200 items for a title that doesn't start with Now: or Live:
+    prog_real = requests.get(f'http://192.168.1.100:8096/jellyfin/LiveTv/Programs?UserId={uid}&HasAired=false&Limit=200', 
                        headers={'X-Emby-Token': tok}).json()
     items = prog_real.get('Items', [])
-    real_names = [i['Name'] for i in items if not i['Name'].startswith('Live:')]
-    if len(real_names) > 0:
-        print(f"✅ Real EPG Content: PASS ('{real_names[0]}')")
+    provider_progs = [i['Name'] for i in items if not (i['Name'].startswith('Live:') or i['Name'].startswith('Now:'))]
+    if len(provider_progs) > 0:
+        print(f"✅ Real Provider EPG Content: PASS ('{provider_progs[0]}')")
     else:
-        print("❌ Real EPG Content: FAIL (Still placeholders)")
+        print("❌ Real Provider EPG Content: FAIL (Only fallbacks found in first 200 items)")
 
 except Exception as e:
     print(f"❌ Jellyfin API: ERROR ({e})")
