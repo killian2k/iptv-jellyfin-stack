@@ -15,14 +15,9 @@ from zoneinfo import ZoneInfo
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# DYNAMIC CONFIGURATION
-BASE_URL = os.getenv("IPTV_PROVIDER_URL", "http://your-provider.com:8000/server/load.php")
-MAC = os.getenv("IPTV_MAC_ADDRESS", "00:00:00:00:00:00")
-UA = os.getenv("IPTV_USER_AGENT", "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/531.2+ (KHTML, like Gecko) Version/4.0 Safari/531.2+ STB/MAG256")
-PROXY_BASE = os.getenv("IPTV_PROXY_BASE", "http://localhost/iptv")
-XMLTV_PATH = os.getenv("IPTV_XMLTV_PATH", "/app/data/xmltv.xml")
-USER_TIMEZONE = os.getenv("IPTV_TIMEZONE", "Europe/Zurich")
-
+BASE_URL = "http://your-provider.com:8000/server/load.php"
+MAC = "00:00:00:00:00:00"
+UA = "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/531.2+ (KHTML, like Gecko) Version/4.0 Safari/531.2+ STB/MAG256"
 STB_HEADERS = {
     "User-Agent": UA,
     "X-User-Agent": "Model: MAG256; Link: WiFi",
@@ -30,7 +25,11 @@ STB_HEADERS = {
     "Connection": "Keep-Alive"
 }
 
-cache = {"channels": [], "epg_data": {}, "playlist": None, "xmltv": None, "token": None, "token_time": 0}
+PROXY_BASE = "http://192.168.1.100/iptv"
+XMLTV_PATH = "/app/data/xmltv.xml"
+USER_TIMEZONE = "Europe/Zurich"
+
+cache = {"channels": [], "playlist": None, "xmltv": None, "token": None, "token_time": 0}
 cache_lock = threading.Lock()
 
 def handshake():
@@ -81,8 +80,7 @@ def get_category_info(name):
     is_cinema = any(x in name_upper for x in ["CANAL+", "CINE+", "OCS", "MOVIE", "FILM", "CINEMA"])
     is_news = any(x in name_upper for x in ["NEWS", "INFO", "BFM", "CNEWS", "LCI", "CNN", "BBC", "FOX NEWS", "MSNBC"])
     is_kids = any(x in name_upper for x in ["KIDS", "DISNEY", "NICKELODEON", "CARTOON", "GULLI", "PIWI", "BOOMERANG"])
-    tags = [country]
-    xml_cat = "Entertainment"
+    tags = [country]; xml_cat = "Entertainment"
     if is_sport: tags.append("Sports"); xml_cat = "Sports"
     elif is_cinema: tags.append("Movies"); xml_cat = "Movies"
     elif is_news: tags.append("News"); xml_cat = "News"
@@ -97,7 +95,8 @@ def update_cache():
     headers["Authorization"] = f"Bearer {token}"
     try:
         resp = requests.get(BASE_URL, params={"type": "itv", "action": "get_all_channels"}, headers=headers, timeout=40)
-        channels = resp.json().get('js', {}).get('data', [])
+        all_channels = resp.json().get('js', {}).get('data', [])
+        
         epg_map = {}
         genre_ids = ['3', '511', '1469', '1468', '1467', '1433', '1499', '4', '1404', '951', '62', '19', '1350']
         for g_id in genre_ids:
@@ -105,15 +104,16 @@ def update_cache():
                 e_resp = requests.get(BASE_URL, params={"type": "itv", "action": "get_epg_info", "genre_id": g_id}, headers=headers, timeout=30).json()
                 if 'js' in e_resp and 'data' in e_resp['js']: epg_map.update(e_resp['js']['data'])
             except: pass
+        
         processed = []
         m3u = "#EXTM3U\n"
         tv = ET.Element("tv", {"generator-info-name": "IPTV Proxy"})
-        for ch in channels:
+        for ch in all_channels:
             name = ch.get('name', '')
             group, xml_cat = get_category_info(name)
             if not group: continue
             ch_id = str(ch.get('id'))
-            processed.append({'id': ch_id, 'display_name': clean_name(name), 'group': group, 'xml_cat': xml_cat, 'logo': ch.get('logo', ''), 'cmd': ch.get('cmd')})
+            processed.append({'id': ch_id, 'display_name': clean_name(name), 'group': group, 'xml_cat': xml_cat, 'cmd': ch.get('cmd')})
             if ch_id in epg_map:
                 chan_tag = ET.SubElement(tv, "channel", {"id": ch_id})
                 ET.SubElement(chan_tag, "display-name").text = clean_name(name)
@@ -123,18 +123,11 @@ def update_cache():
         now = datetime.now(tz)
         for item in processed:
             cid = item["id"]
-            m3u += f'#EXTINF:-1 tvg-id="{cid}" tvg-name="{item["display_name"]}" tvg-logo="{item["logo"]}" group-title="{item["group"]}",{item["display_name"]}\n'
+            m3u += f'#EXTINF:-1 tvg-id="{cid}" tvg-name="{item["display_name"]}" group-title="{item["group"]}",{item["display_name"]}\n'
             m3u += f'{PROXY_BASE}/play/{cid}.ts\n'
             real_progs = epg_map.get(cid, [])
             if real_progs:
                 real_progs.sort(key=lambda x: int(x['start_timestamp']))
-                first_start = datetime.fromtimestamp(int(real_progs[0]['start_timestamp']), tz=tz)
-                bridge_start = (now - timedelta(hours=6)).replace(minute=0, second=0, microsecond=0)
-                if bridge_start < first_start:
-                    prog = ET.SubElement(tv, "programme", {"start": bridge_start.strftime("%Y%m%d%H%M%S %z"), "stop": first_start.strftime("%Y%m%d%H%M%S %z"), "channel": cid})
-                    ET.SubElement(prog, "title", {"lang": "en"}).text = f"Live: {item['display_name']}"
-                    ET.SubElement(prog, "desc", {"lang": "en"}).text = f"Currently airing on {item['display_name']}."
-                    ET.SubElement(prog, "category", {"lang": "en"}).text = item["xml_cat"]
                 for p in real_progs:
                     try:
                         p_start = datetime.fromtimestamp(int(p['start_timestamp']), tz=tz).strftime("%Y%m%d%H%M%S %z")
@@ -149,6 +142,7 @@ def update_cache():
             with open(XMLTV_PATH, "w", encoding="utf-8") as f: f.write(xml_str)
         with cache_lock:
             cache["channels"], cache["playlist"], cache["xmltv"] = processed, m3u, xml_str
+        logging.info("Cache update complete.")
     except Exception as e: logging.error(f"Update error: {e}")
 
 def background_worker():
@@ -174,9 +168,7 @@ def play(ch_id):
     def generate():
         last_url, last_headers, fail_count = None, None, 0
         leftover = b'' 
-        is_reconnecting = False
-
-        while fail_count < 20:
+        while fail_count < 10:
             if not last_url:
                 cmd_val, last_headers = get_stream_link("itv", ch_data.get('cmd'), cid)
                 if not cmd_val:
@@ -186,39 +178,32 @@ def play(ch_id):
                 last_url = f"{'/'.join(parts[:3])}/{parts[3]}/{parts[4]}/{parts[-1]}?play_token={cmd_val.split('play_token=')[-1]}"
 
             try:
-                logging.info(f"Seamless Stream for {cid}")
+                logging.info(f"Stream Start for {cid}")
                 with requests.get(last_url, headers=last_headers, stream=True, timeout=15) as upstream:
                     if upstream.status_code == 403:
                         last_url, fail_count = None, fail_count + 1; continue
                     
                     fail_count = 0
-                    first_chunk = True
                     for chunk in upstream.iter_content(chunk_size=256*1024):
                         if chunk:
-                            # PRECISION STITCHING: If this is a reconnect, strip the PAT/PMT headers (first 188 bytes)
-                            # to prevent audio/video player glitches
-                            if is_reconnecting and first_chunk:
-                                chunk = chunk[188*2:] # Skip start of stream metadata
-                                first_chunk = False
-                            
                             data = leftover + chunk
                             align_idx = (len(data) // 188) * 188
                             to_send = data[:align_idx]
                             leftover = data[align_idx:]
                             if to_send: yield to_send
                     
-                    logging.warning(f"Handover triggered for {cid}...")
+                    logging.warning(f"Connection ended for {cid}. Re-linking...")
                     last_url = None 
-                    is_reconnecting = True # Flag for next loop to strip headers
             except GeneratorExit: break
-            except Exception:
+            except Exception as e:
+                logging.error(f"Stream Error for {cid}: {e}. Retrying...")
                 last_url, fail_count = None, fail_count + 1
-                is_reconnecting = True
-                time.sleep(random.uniform(0.5, 1.5))
+                time.sleep(random.uniform(0.5, 2.0))
 
     return Response(stream_with_context(generate()), content_type='video/mp2t', direct_passthrough=True)
 
 if __name__ == '__main__':
-    threading.Thread(target=update_cache).start()
+    # Initialize cache immediately before starting the server
+    update_cache()
     threading.Thread(target=background_worker, daemon=True).start()
     app.run(host='0.0.0.0', port=8081, threaded=True)
