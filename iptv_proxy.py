@@ -6,13 +6,15 @@ import threading
 import re
 import json
 import base64
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-BASE_URL = "http://pure-ott.com:8000/server/load.php"
-MAC = "00:1A:79:3F:6E:5a"
+BASE_URL = "http://your-provider.com:8000/server/load.php"
+MAC = "00:00:00:00:00:00"
 UA = "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/531.2+ (KHTML, like Gecko) Version/4.0 Safari/531.2+ STB/MAG256"
 PROXY_BASE = "http://192.168.1.100/iptv"
 
@@ -46,7 +48,6 @@ def clean_name(name):
     clean = re.sub(r'\|[^\|]+\|', '', name)
     clean = re.sub(r'USA:', '', clean)
     clean = re.sub(r'[▼●★■□▲▶▷\-\s]+', ' ', clean).strip()
-    clean = clean.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&apos;')
     return clean
 
 def get_category_info(name):
@@ -93,39 +94,54 @@ def update_cache():
         channels = resp.json().get('js', {}).get('data', [])
         processed = []
         m3u = "#EXTM3U\n"
-        xmltv = '<?xml version="1.0" encoding="UTF-8"?>\n<tv generator-info-name="IPTV Proxy">\n'
+        
+        # Build XML using ElementTree to handle escaping perfectly
+        tv = ET.Element("tv", {"generator-info-name": "IPTV Proxy"})
         
         for ch in channels:
             group, xml_cat = get_category_info(ch.get('name', ''))
             if not group: continue
             ch_id = str(ch.get('id'))
             display_name = clean_name(ch.get('name', ''))
-            processed.append({'id': ch_id, 'display_name': display_name, 'group': group, 'xml_cat': xml_cat, 'logo': ch.get('logo', ''), 'cmd': ch.get('cmd')})
-        
-        for item in processed:
-            m3u += f'#EXTINF:-1 tvg-id="{item["id"]}" tvg-name="{item["display_name"]}" tvg-logo="{item["logo"]}" group-title="{item["group"]}",{item["display_name"]}\n'
-            m3u += f'{PROXY_BASE}/play/{item["id"]}.ts\n'
-            xmltv += f'  <channel id="{item["id"]}"><display-name>{item["display_name"]}</display-name>'
-            if item["logo"]: xmltv += f'<icon src="{item["logo"]}" />'
-            xmltv += '</channel>\n'
+            logo = ch.get('logo', '')
             
+            processed.append({'id': ch_id, 'display_name': display_name, 'group': group, 'xml_cat': xml_cat, 'logo': logo, 'cmd': ch.get('cmd')})
+            
+            # Channel entry
+            chan_tag = ET.SubElement(tv, "channel", {"id": ch_id})
+            ET.SubElement(chan_tag, "display-name").text = display_name
+            if logo:
+                ET.SubElement(chan_tag, "icon", {"src": logo})
+        
         now = datetime.utcnow()
         start = now.replace(minute=0, second=0, microsecond=0)
+        
         for item in processed:
-            for i in range(24):
+            # Multi-category M3U
+            m3u += f'#EXTINF:-1 tvg-id="{item["id"]}" tvg-name="{item["display_name"]}" tvg-logo="{item["logo"]}" group-title="{item["group"]}",{item["display_name"]}\n'
+            m3u += f'{PROXY_BASE}/play/{item["id"]}.ts\n'
+            
+            # Generate 12h guide (Smaller file, more stable)
+            for i in range(12):
                 p_start = (start + timedelta(hours=i)).strftime("%Y%m%d%H%M%S +0000")
                 p_end = (start + timedelta(hours=i+1)).strftime("%Y%m%d%H%M%S +0000")
-                xmltv += f'  <programme start="{p_start}" stop="{p_end}" channel="{item["id"]}">\n'
-                xmltv += f'    <title lang="en">Live: {item["display_name"]}</title>\n'
-                xmltv += f'    <desc lang="en">Live stream for {item["display_name"]}.</desc>\n'
-                xmltv += f'    <category lang="en">{item["xml_cat"]}</category>\n'
-                xmltv += f'  </programme>\n'
-        xmltv += '</tv>'
+                
+                prog = ET.SubElement(tv, "programme", {
+                    "start": p_start,
+                    "stop": p_end,
+                    "channel": item["id"]
+                })
+                ET.SubElement(prog, "title", {"lang": "en"}).text = f"Live: {item['display_name']}"
+                ET.SubElement(prog, "desc", {"lang": "en"}).text = f"Live stream for {item['display_name']} on {item['group']}."
+                ET.SubElement(prog, "category", {"lang": "en"}).text = item["xml_cat"]
+
+        # Serialize XML
+        xml_str = ET.tostring(tv, encoding='utf-8', xml_declaration=True).decode('utf-8')
         
         with cache_lock:
             cache["channels"] = channels
             cache["playlist"] = m3u
-            cache["xmltv"] = xmltv
+            cache["xmltv"] = xml_str
             cache["last_update"] = time.time()
         logging.info(f"Cache updated: {len(processed)} channels.")
     except Exception as e: logging.error(f"Update error: {e}")
